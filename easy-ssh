@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM=${0##*/}
+CONFIG_FILE=.easy-ssh.conf
+IGNORE_FILE=.easy-ssh-ignore
+LOG_FILE=.easy-ssh-log
+STATUS_FILE=.easy-ssh-status
+SIZE_WARN_KB=${EASY_SSH_SIZE_WARN_KB:-512000}
+SSH_CONNECT_TIMEOUT=${EASY_SSH_CONNECT_TIMEOUT:-5}
+LOG_LINES=${EASY_SSH_LOG_LINES:-50}
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT")
+
+host=""
+remote_dir=""
+remote_dir_real=""
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM init
+  $PROGRAM push [--clean] [--force]
+  $PROGRAM run "<cmd>"
+  $PROGRAM submit "<cmd>"
+  $PROGRAM logs
+  $PROGRAM pull <path>
+  $PROGRAM clean [--force]
+  $PROGRAM status
+
+Commands:
+  init           Interactive setup for .easy-ssh.conf
+  push           Sync local directory to remote (additive-only)
+  push --clean   Preview destructive sync; add --force to execute
+  run            Push + run command remotely, wait for completion
+  submit         Push + launch remote job in tmux/nohup, return immediately
+  logs           Show the tail of the remote log file
+  pull           Fetch a remote path back into the local project
+  clean          Preview remote-only files; add --force to remove them
+  status         Show config, SSH status, and submitted job status
+EOF
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+strip_outer_quotes() {
+    local value="$1"
+    if [[ ${#value} -ge 2 ]]; then
+        if [[ ${value:0:1} == "'" && ${value: -1} == "'" ]]; then
+            value=${value:1:-1}
+        elif [[ ${value:0:1} == '"' && ${value: -1} == '"' ]]; then
+            value=${value:1:-1}
+        fi
+    fi
+    printf '%s' "$value"
+}
+
+parse_config_value() {
+    local value
+    value=$(trim "$1")
+    value=${value%%#*}
+    value=$(trim "$value")
+    value=$(strip_outer_quotes "$value")
+    printf '%s' "$value"
+}
+
+load_config() {
+    local line raw
+
+    [[ -f "$CONFIG_FILE" ]] || die "no $CONFIG_FILE found. Run '$PROGRAM init' first"
+
+    host=""
+    remote_dir=""
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=$(trim "$line")
+        [[ -z $line || ${line:0:1} == '#' ]] && continue
+
+        case "$line" in
+            host=*)
+                raw=${line#host=}
+                host=$(parse_config_value "$raw")
+                ;;
+            remote_dir=*)
+                raw=${line#remote_dir=}
+                remote_dir=$(parse_config_value "$raw")
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    [[ -n $host ]] || die "'host' not set in $CONFIG_FILE"
+    [[ -n $remote_dir ]] || die "'remote_dir' not set in $CONFIG_FILE"
+}
+
+quote_config_value() {
+    local value="$1"
+    value=${value//\'/\'\\\'\'}
+    printf "'%s'" "$value"
+}
+
+require_local_tools() {
+    local tool
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null 2>&1 || die "missing required command: $tool"
+    done
+}
+
+ensure_ssh_connection() {
+    ssh "${SSH_OPTS[@]}" "$host" true >/dev/null 2>&1 || die "ssh connection to '$host' failed"
+}
+
+resolve_remote_dir() {
+    local create_remote=${1:-0}
+
+    remote_dir_real=$(ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir" "$create_remote" <<'EOF'
+set -euo pipefail
+
+dir=$1
+create_remote=${2:-0}
+
+case "$dir" in
+    '~')
+        dir=$HOME
+        ;;
+    '~/'*)
+        dir="$HOME/${dir#~/}"
+        ;;
+esac
+
+if [[ "$create_remote" == "1" ]]; then
+    mkdir -p -- "$dir"
+fi
+
+printf '%s\n' "$dir"
+EOF
+) || die "failed to resolve remote_dir '$remote_dir' on '$host'"
+}
+
+check_local_size() {
+    local force=${1:-0}
+    local size_kb size_mb limit_mb
+
+    if ! read -r size_kb _ < <(du -sk . 2>/dev/null); then
+        return 0
+    fi
+
+    if (( size_kb <= SIZE_WARN_KB )); then
+        return 0
+    fi
+
+    size_mb=$(((size_kb + 1023) / 1024))
+    limit_mb=$(((SIZE_WARN_KB + 1023) / 1024))
+
+    if (( force )); then
+        warn "local directory is ${size_mb}MB (> ${limit_mb}MB); continuing because --force was given"
+        return 0
+    fi
+
+    die "local directory is ${size_mb}MB (> ${limit_mb}MB). Refusing to sync; add $IGNORE_FILE entries or re-run with --force"
+}
+
+build_rsync_args() {
+    RSYNC_ARGS=(-avz)
+    if [[ -f "$IGNORE_FILE" ]]; then
+        RSYNC_ARGS+=("--filter=:- $IGNORE_FILE")
+    fi
+}
+
+push_files() {
+    local clean=${1:-0}
+    local force=${2:-0}
+    local dest
+
+    require_local_tools ssh rsync du
+    load_config
+    ensure_ssh_connection
+    resolve_remote_dir 1
+    check_local_size "$force"
+    build_rsync_args
+
+    dest="$host:$remote_dir_real/"
+
+    if (( clean )); then
+        if (( force )); then
+            rsync "${RSYNC_ARGS[@]}" --delete ./ "$dest"
+        else
+            rsync "${RSYNC_ARGS[@]}" --delete --dry-run ./ "$dest"
+            info "Preview only. Re-run with '--force' to apply deletions."
+        fi
+    else
+        rsync "${RSYNC_ARGS[@]}" ./ "$dest"
+    fi
+}
+
+validate_pull_path() {
+    local path="$1"
+
+    [[ -n $path ]] || die "pull requires a relative path"
+    [[ $path != /* ]] || die "pull path must be relative to remote_dir"
+
+    case "$path" in
+        ..|../*|*/../*|*/..)
+            die "pull path must stay inside remote_dir"
+            ;;
+    esac
+}
+
+do_init() {
+    local current_host=""
+    local current_remote_dir=""
+    local input_host input_remote_dir
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if load_config >/dev/null 2>&1; then
+            current_host=$host
+            current_remote_dir=$remote_dir
+        fi
+    fi
+
+    printf 'SSH host'
+    [[ -n $current_host ]] && printf ' [%s]' "$current_host"
+    printf ': '
+    IFS= read -r input_host
+    input_host=${input_host:-$current_host}
+
+    printf 'Remote directory'
+    [[ -n $current_remote_dir ]] && printf ' [%s]' "$current_remote_dir"
+    printf ': '
+    IFS= read -r input_remote_dir
+    input_remote_dir=${input_remote_dir:-$current_remote_dir}
+
+    [[ -n $input_host ]] || die "host is required"
+    [[ -n $input_remote_dir ]] || die "remote directory is required"
+
+    cat > "$CONFIG_FILE" <<EOF
+host=$(quote_config_value "$input_host")
+remote_dir=$(quote_config_value "$input_remote_dir")
+EOF
+
+    info "wrote $CONFIG_FILE"
+    if [[ ! -f "$IGNORE_FILE" ]]; then
+        info "tip: create $IGNORE_FILE to exclude data, virtualenvs, or build outputs from rsync"
+    fi
+}
+
+do_push() {
+    local clean=0 force=0 arg
+
+    while [[ $# -gt 0 ]]; do
+        arg=$1
+        case "$arg" in
+            --clean)
+                clean=1
+                ;;
+            --force)
+                force=1
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                die "unknown option for push: $arg"
+                ;;
+        esac
+        shift
+    done
+
+    push_files "$clean" "$force"
+}
+
+run_remote_command() {
+    local cmd="$1"
+    local qdir full_cmd qfull rc
+
+    printf -v qdir '%q' "$remote_dir_real"
+    full_cmd="cd $qdir && $cmd"
+    printf -v qfull '%q' "$full_cmd"
+
+    set +e
+    ssh "${SSH_OPTS[@]}" "$host" "bash -l -c $qfull"
+    rc=$?
+    set -e
+
+    return "$rc"
+}
+
+do_run() {
+    local cmd=${1:-}
+
+    [[ $# -eq 1 ]] || die "usage: $PROGRAM run \"<cmd>\""
+
+    push_files 0 0
+    run_remote_command "$cmd"
+}
+
+do_submit() {
+    local cmd=${1:-}
+    local qdir qlog qstatus qjobfile full_cmd qfull job_body launch_output rc
+
+    [[ $# -eq 1 ]] || die "usage: $PROGRAM submit \"<cmd>\""
+
+    push_files 0 0
+
+    printf -v qdir '%q' "$remote_dir_real"
+    printf -v qlog '%q' "$remote_dir_real/$LOG_FILE"
+    printf -v qstatus '%q' "$remote_dir_real/$STATUS_FILE"
+    printf -v qjobfile '%q' "$remote_dir_real/.easy-ssh-job.sh"
+    full_cmd="cd $qdir && $cmd"
+    printf -v qfull '%q' "$full_cmd"
+
+    job_body=$(cat <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+trap 'rm -f -- $qjobfile' EXIT
+: > $qlog
+echo "running:\$BASHPID" > $qstatus
+bash -l -c $qfull 2>&1 | tee $qlog
+rc=\${PIPESTATUS[0]}
+echo "\$rc" > $qstatus
+exit "\$rc"
+EOF
+)
+
+    set +e
+    launch_output=$(ssh "${SSH_OPTS[@]}" "$host" bash -s <<EOF
+set -euo pipefail
+
+session_name=easy-ssh
+status_path=$qstatus
+job_file=$qjobfile
+
+if [[ -f $qstatus ]]; then
+    status_content=\$(<$qstatus)
+    if [[ \$status_content == running:* ]]; then
+        pid=\${status_content#running:}
+        if kill -0 "\$pid" 2>/dev/null; then
+            echo "error: easy-ssh job already running (pid \$pid)" >&2
+            exit 1
+        fi
+    fi
+fi
+
+cat > $qjobfile <<'EASY_SSH_JOB'
+$job_body
+EASY_SSH_JOB
+chmod +x $qjobfile
+
+if command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t "\$session_name" 2>/dev/null; then
+        echo "error: tmux session '\$session_name' already exists" >&2
+        exit 1
+    fi
+
+    tmux new-session -d -s "\$session_name" "bash $qjobfile"
+    echo "tmux:\$session_name"
+else
+    nohup bash $qjobfile >/dev/null 2>&1 < /dev/null &
+    echo "nohup:\$!"
+fi
+EOF
+)
+    rc=$?
+    set -e
+
+    (( rc == 0 )) || return "$rc"
+
+    case "$launch_output" in
+        tmux:*)
+            info "submitted job via tmux session '${launch_output#tmux:}'"
+            ;;
+        nohup:*)
+            info "submitted job via nohup (pid ${launch_output#nohup:})"
+            ;;
+        *)
+            info "$launch_output"
+            ;;
+    esac
+
+    info "log: $remote_dir_real/$LOG_FILE"
+    info "status: $remote_dir_real/$STATUS_FILE"
+}
+
+do_logs() {
+    local rc
+
+    require_local_tools ssh tail
+    load_config
+    ensure_ssh_connection
+    resolve_remote_dir 0
+
+    set +e
+    ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir_real" "$LOG_FILE" "$LOG_LINES" <<'EOF'
+set -euo pipefail
+
+dir=$1
+log_name=$2
+lines=$3
+log_path="$dir/$log_name"
+
+[[ -f "$log_path" ]] || {
+    echo "error: no log file found at $log_path" >&2
+    exit 1
+}
+
+tail -n "$lines" "$log_path"
+EOF
+    rc=$?
+    set -e
+
+    return "$rc"
+}
+
+do_pull() {
+    local path=${1:-}
+    local parent_dir
+
+    [[ $# -eq 1 ]] || die "usage: $PROGRAM pull <path>"
+
+    validate_pull_path "$path"
+    require_local_tools ssh rsync mkdir
+    load_config
+    ensure_ssh_connection
+    resolve_remote_dir 0
+
+    parent_dir=$(dirname "$path")
+    mkdir -p -- "$parent_dir"
+    rsync -avz "$host:$remote_dir_real/$path" "$path"
+}
+
+do_clean() {
+    local force=0 arg
+
+    while [[ $# -gt 0 ]]; do
+        arg=$1
+        case "$arg" in
+            --force)
+                force=1
+                ;;
+            -h|--help)
+                usage
+                return 0
+                ;;
+            *)
+                die "unknown option for clean: $arg"
+                ;;
+        esac
+        shift
+    done
+
+    require_local_tools ssh rsync
+    load_config
+    ensure_ssh_connection
+    resolve_remote_dir 0
+    build_rsync_args
+
+    if (( force )); then
+        rsync "${RSYNC_ARGS[@]}" --delete --existing --ignore-existing ./ "$host:$remote_dir_real/"
+    else
+        rsync "${RSYNC_ARGS[@]}" --delete --dry-run --existing --ignore-existing ./ "$host:$remote_dir_real/"
+        info "Preview only. Re-run with '--force' to remove remote-only files."
+    fi
+}
+
+do_status() {
+    local rc
+
+    require_local_tools ssh
+    load_config
+
+    info "host: $host"
+    info "remote_dir: $remote_dir"
+
+    ensure_ssh_connection
+    resolve_remote_dir 0
+
+    info "ssh: ok"
+    info "resolved_remote_dir: $remote_dir_real"
+
+    set +e
+    ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir_real" "$STATUS_FILE" <<'EOF'
+set -euo pipefail
+
+dir=$1
+status_name=$2
+status_path="$dir/$status_name"
+
+if [[ ! -d "$dir" ]]; then
+    echo "job: remote directory does not exist yet"
+    exit 0
+fi
+
+if [[ ! -f "$status_path" ]]; then
+    echo "job: no submitted job status found"
+    exit 0
+fi
+
+status_content=$(<"$status_path")
+
+if [[ $status_content == running:* ]]; then
+    pid=${status_content#running:}
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "job: running (pid $pid)"
+    else
+        echo "job: stale running marker (pid $pid not found)"
+    fi
+elif [[ $status_content =~ ^-?[0-9]+$ ]]; then
+    echo "job: finished (exit $status_content)"
+else
+    echo "job: unknown status '$status_content'"
+fi
+EOF
+    rc=$?
+    set -e
+
+    return "$rc"
+}
+
+main() {
+    local command=${1:-}
+
+    case "$command" in
+        init)
+            shift
+            do_init "$@"
+            ;;
+        push)
+            shift
+            do_push "$@"
+            ;;
+        run)
+            shift
+            do_run "$@"
+            ;;
+        submit)
+            shift
+            do_submit "$@"
+            ;;
+        logs)
+            shift
+            do_logs "$@"
+            ;;
+        pull)
+            shift
+            do_pull "$@"
+            ;;
+        clean)
+            shift
+            do_clean "$@"
+            ;;
+        status)
+            shift
+            do_status "$@"
+            ;;
+        -h|--help|help|"")
+            usage
+            ;;
+        *)
+            die "unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
