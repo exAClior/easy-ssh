@@ -72,6 +72,22 @@ chmod +x ./easy-ssh
 ln -sf "$PWD/easy-ssh" ~/.local/bin/easy-ssh
 ```
 
+## Claude Code Skill
+
+Give Claude Code the ability to use `easy-ssh` on your behalf — sync files, run commands remotely, pull results — all from natural language.
+
+```bash
+npx skills add exAClior/easy-ssh --skill easy-ssh
+```
+
+This installs the skill globally. To scope it to a single project:
+
+```bash
+npx skills add exAClior/easy-ssh --skill easy-ssh -y
+```
+
+Once installed, Claude Code will automatically use `easy-ssh` when you ask it to run something on a server, submit a job, or pull remote results.
+
 ## Test
 
 ```bash
