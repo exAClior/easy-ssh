@@ -14,6 +14,9 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT")
 host=""
 remote_dir=""
 remote_dir_real=""
+DEFAULT_EXCLUDES=(.git .venv)
+RSYNC_ARGS=()
+RSYNC_SIZE_ARGS=()
 
 usage() {
     cat <<EOF
@@ -23,6 +26,7 @@ Usage:
   $PROGRAM run "<cmd>"
   $PROGRAM submit "<cmd>"
   $PROGRAM logs
+  $PROGRAM monitor
   $PROGRAM pull <path>
   $PROGRAM clean [--force]
   $PROGRAM status
@@ -32,8 +36,9 @@ Commands:
   push           Sync local directory to remote (additive-only)
   push --clean   Preview destructive sync; add --force to execute
   run            Push + run command remotely, wait for completion
-  submit         Push + launch remote job in tmux/nohup, return immediately
+  submit         Push + launch remote job via nohup, return immediately
   logs           Show the tail of the remote log file
+  monitor        Live-stream remote job output (tail -f); stops when job ends
   pull           Fetch a remote path back into the local project
   clean          Preview remote-only files; add --force to remove them
   status         Show config, SSH status, and submitted job status
@@ -62,11 +67,13 @@ trim() {
 
 strip_outer_quotes() {
     local value="$1"
-    if [[ ${#value} -ge 2 ]]; then
-        if [[ ${value:0:1} == "'" && ${value: -1} == "'" ]]; then
-            value=${value:1:-1}
-        elif [[ ${value:0:1} == '"' && ${value: -1} == '"' ]]; then
-            value=${value:1:-1}
+    local len=${#value}
+    if [[ $len -ge 2 ]]; then
+        local last=${value:$((len-1)):1}
+        if [[ ${value:0:1} == "'" && $last == "'" ]]; then
+            value=${value:1:$((len-2))}
+        elif [[ ${value:0:1} == '"' && $last == '"' ]]; then
+            value=${value:1:$((len-2))}
         fi
     fi
     printf '%s' "$value"
@@ -135,14 +142,11 @@ set -euo pipefail
 dir=$1
 create_remote=${2:-0}
 
-case "$dir" in
-    '~')
-        dir=$HOME
-        ;;
-    '~/'*)
-        dir="$HOME/${dir#~/}"
-        ;;
-esac
+if [[ "$dir" == '~' ]]; then
+    dir=$HOME
+elif [[ "$dir" == '~/'* ]]; then
+    dir="$HOME/${dir#~/}"
+fi
 
 if [[ "$create_remote" == "1" ]]; then
     mkdir -p -- "$dir"
@@ -155,10 +159,33 @@ EOF
 
 check_local_size() {
     local force=${1:-0}
-    local size_kb size_mb limit_mb
+    local size_kb size_mb limit_mb size_bytes=""
+    local tmpdir stats line rc
 
-    if ! read -r size_kb _ < <(du -sk . 2>/dev/null); then
-        return 0
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/easy-ssh-size.XXXXXX") || true
+    if [[ -n ${tmpdir:-} ]]; then
+        set +e
+        stats=$(rsync "${RSYNC_SIZE_ARGS[@]}" --dry-run --stats ./ "$tmpdir/" 2>/dev/null)
+        rc=$?
+        set -e
+        rm -rf -- "$tmpdir"
+
+        if (( rc == 0 )); then
+            while IFS= read -r line; do
+                if [[ $line =~ ^Total\ file\ size:\ ([0-9,]+)\ B$ ]]; then
+                    size_bytes=${BASH_REMATCH[1]//,/}
+                    break
+                fi
+            done <<< "$stats"
+        fi
+    fi
+
+    if [[ -n $size_bytes ]]; then
+        size_kb=$(((size_bytes + 1023) / 1024))
+    else
+        if ! read -r size_kb _ < <(du -sk . 2>/dev/null); then
+            return 0
+        fi
     fi
 
     if (( size_kb <= SIZE_WARN_KB )); then
@@ -169,18 +196,52 @@ check_local_size() {
     limit_mb=$(((SIZE_WARN_KB + 1023) / 1024))
 
     if (( force )); then
-        warn "local directory is ${size_mb}MB (> ${limit_mb}MB); continuing because --force was given"
+        warn "effective sync size is ${size_mb}MB (> ${limit_mb}MB); continuing because --force was given"
         return 0
     fi
 
-    die "local directory is ${size_mb}MB (> ${limit_mb}MB). Refusing to sync; add $IGNORE_FILE entries or re-run with --force"
+    die "effective sync size is ${size_mb}MB (> ${limit_mb}MB). Refusing to sync; add $IGNORE_FILE entries or re-run with --force"
 }
 
 build_rsync_args() {
+    local pattern
+
     RSYNC_ARGS=(-avz)
+    RSYNC_SIZE_ARGS=(-az)
+
+    for pattern in "${DEFAULT_EXCLUDES[@]}"; do
+        RSYNC_ARGS+=("--exclude=$pattern")
+        RSYNC_SIZE_ARGS+=("--exclude=$pattern")
+    done
+
     if [[ -f "$IGNORE_FILE" ]]; then
         RSYNC_ARGS+=("--filter=:- $IGNORE_FILE")
+        RSYNC_SIZE_ARGS+=("--filter=:- $IGNORE_FILE")
     fi
+}
+
+prune_default_remote_excludes() {
+    local force=${1:-0}
+
+    ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir_real" "$force" "${DEFAULT_EXCLUDES[@]}" <<'EOF'
+set -euo pipefail
+
+dir=$1
+force=${2:-0}
+shift 2
+
+for name in "$@"; do
+    path="$dir/$name"
+    [[ -e "$path" ]] || continue
+
+    if [[ "$force" == "1" ]]; then
+        rm -rf -- "$path"
+        printf 'removed default-excluded path: %s\n' "$path"
+    else
+        printf 'would remove default-excluded path: %s\n' "$path"
+    fi
+done
+EOF
 }
 
 push_files() {
@@ -188,20 +249,22 @@ push_files() {
     local force=${2:-0}
     local dest
 
-    require_local_tools ssh rsync du
+    require_local_tools ssh rsync du mktemp
     load_config
     ensure_ssh_connection
     resolve_remote_dir 1
-    check_local_size "$force"
     build_rsync_args
+    check_local_size "$force"
 
     dest="$host:$remote_dir_real/"
 
     if (( clean )); then
         if (( force )); then
             rsync "${RSYNC_ARGS[@]}" --delete ./ "$dest"
+            prune_default_remote_excludes 1
         else
             rsync "${RSYNC_ARGS[@]}" --delete --dry-run ./ "$dest"
+            prune_default_remote_excludes 0
             info "Preview only. Re-run with '--force' to apply deletions."
         fi
     else
@@ -256,7 +319,7 @@ EOF
 
     info "wrote $CONFIG_FILE"
     if [[ ! -f "$IGNORE_FILE" ]]; then
-        info "tip: create $IGNORE_FILE to exclude data, virtualenvs, or build outputs from rsync"
+        info "tip: easy-ssh already skips .git and .venv; create $IGNORE_FILE for data, build outputs, or other local-only files"
     fi
 }
 
@@ -331,7 +394,7 @@ do_submit() {
 set -uo pipefail
 trap 'rm -f -- $qjobfile' EXIT
 : > $qlog
-echo "running:\$BASHPID" > $qstatus
+echo "running:\$\$" > $qstatus
 bash -l -c $qfull 2>&1 | tee $qlog
 rc=\${PIPESTATUS[0]}
 echo "\$rc" > $qstatus
@@ -363,18 +426,8 @@ $job_body
 EASY_SSH_JOB
 chmod +x $qjobfile
 
-if command -v tmux >/dev/null 2>&1; then
-    if tmux has-session -t "\$session_name" 2>/dev/null; then
-        echo "error: tmux session '\$session_name' already exists" >&2
-        exit 1
-    fi
-
-    tmux new-session -d -s "\$session_name" "bash $qjobfile"
-    echo "tmux:\$session_name"
-else
-    nohup bash $qjobfile >/dev/null 2>&1 < /dev/null &
-    echo "nohup:\$!"
-fi
+nohup bash $qjobfile >/dev/null 2>&1 < /dev/null &
+echo "nohup:\$!"
 EOF
 )
     rc=$?
@@ -382,17 +435,7 @@ EOF
 
     (( rc == 0 )) || return "$rc"
 
-    case "$launch_output" in
-        tmux:*)
-            info "submitted job via tmux session '${launch_output#tmux:}'"
-            ;;
-        nohup:*)
-            info "submitted job via nohup (pid ${launch_output#nohup:})"
-            ;;
-        *)
-            info "$launch_output"
-            ;;
-    esac
+    info "submitted job via nohup (pid ${launch_output#nohup:})"
 
     info "log: $remote_dir_real/$LOG_FILE"
     info "status: $remote_dir_real/$STATUS_FILE"
@@ -421,6 +464,69 @@ log_path="$dir/$log_name"
 }
 
 tail -n "$lines" "$log_path"
+EOF
+    rc=$?
+    set -e
+
+    return "$rc"
+}
+
+do_monitor() {
+    local rc
+
+    require_local_tools ssh
+    load_config
+    ensure_ssh_connection
+    resolve_remote_dir 0
+
+    info "monitoring $remote_dir_real/$LOG_FILE on $host  (Ctrl+C to detach)"
+
+    set +e
+    ssh "${SSH_OPTS[@]}" -t "$host" bash -s -- "$remote_dir_real" "$LOG_FILE" "$STATUS_FILE" <<'EOF'
+set -euo pipefail
+
+dir=$1
+log_name=$2
+status_name=$3
+log_path="$dir/$log_name"
+status_path="$dir/$status_name"
+
+# Wait for log file to appear (job may still be starting)
+for i in $(seq 1 30); do
+    [[ -f "$log_path" ]] && break
+    sleep 0.5
+done
+
+[[ -f "$log_path" ]] || {
+    echo "error: no log file found at $log_path" >&2
+    exit 1
+}
+
+# Stream log, check job status every 2 seconds, exit when done
+tail -n +1 -f "$log_path" &
+tail_pid=$!
+trap "kill $tail_pid 2>/dev/null; exit" INT TERM
+
+while true; do
+    sleep 2
+    if [[ -f "$status_path" ]]; then
+        status_content=$(<"$status_path")
+        if [[ $status_content =~ ^-?[0-9]+$ ]]; then
+            # Job finished — give tail a moment to flush, then exit
+            sleep 1
+            kill $tail_pid 2>/dev/null || true
+            echo ""
+            if [[ $status_content -eq 0 ]]; then
+                echo "✅ job finished (exit 0)"
+            else
+                echo "❌ job finished (exit $status_content)"
+            fi
+            exit "$status_content"
+        fi
+    fi
+    # If tail died (log removed?), stop
+    kill -0 $tail_pid 2>/dev/null || break
+done
 EOF
     rc=$?
     set -e
@@ -473,8 +579,10 @@ do_clean() {
 
     if (( force )); then
         rsync "${RSYNC_ARGS[@]}" --delete --existing --ignore-existing ./ "$host:$remote_dir_real/"
+        prune_default_remote_excludes 1
     else
         rsync "${RSYNC_ARGS[@]}" --delete --dry-run --existing --ignore-existing ./ "$host:$remote_dir_real/"
+        prune_default_remote_excludes 0
         info "Preview only. Re-run with '--force' to remove remote-only files."
     fi
 }
@@ -556,6 +664,10 @@ main() {
         logs)
             shift
             do_logs "$@"
+            ;;
+        monitor)
+            shift
+            do_monitor "$@"
             ;;
         pull)
             shift

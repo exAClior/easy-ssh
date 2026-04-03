@@ -179,6 +179,7 @@ All commands below assume you are inside your project directory (the one with `.
 | `easy-ssh run "<cmd>"` | Push + execute on remote, **wait** for completion, show output |
 | `easy-ssh submit "<cmd>"` | Push + launch in background, **return immediately** (for long jobs) |
 | `easy-ssh logs` | Tail the remote log from the last `submit` |
+| `easy-ssh monitor` | Live-stream job output in real time; auto-stops when job ends |
 | `easy-ssh pull <path>` | Fetch remote files back to your laptop |
 | `easy-ssh clean` | Show remote-only files; `--force` to remove them |
 | `easy-ssh status` | Show config, test SSH connection, check running jobs |
@@ -203,7 +204,8 @@ easy-ssh pull results/
 easy-ssh submit "python train_model.py --epochs 100"
 
 # Check progress anytime:
-easy-ssh logs          # see the last 50 lines of output
+easy-ssh monitor       # live-stream output (Ctrl+C to detach)
+easy-ssh logs          # snapshot: last 50 lines of output
 easy-ssh status        # see if it's still running or finished
 
 # When done, grab the results:
@@ -211,7 +213,7 @@ easy-ssh pull checkpoints/
 easy-ssh pull results/metrics.json
 ```
 
-`submit` launches the job inside **tmux** on the server (or `nohup` if tmux isn't available), so it keeps running even if your laptop disconnects.
+`submit` launches the job via **nohup** on the server, so it keeps running even if your laptop disconnects.
 
 ### Example: Julia project
 
@@ -238,25 +240,25 @@ You can edit this file by hand if you need to change the host or path.
 
 ### `.easy-ssh-ignore`
 
-Controls what **doesn't** get synced to the server. Same syntax as `.gitignore`. Create this file in your project root:
+Controls what **else** doesn't get synced to the server. Same syntax as `.gitignore`.
+
+`easy-ssh` always skips `.git` and `.venv` automatically. Create this file in your project root for any additional local-only paths:
 
 ```
 __pycache__/
 *.pyc
-.venv/
 data/
 *.h5
 node_modules/
-.git/
 ```
 
-> **Why?** Without this, `easy-ssh push` would upload everything — including huge datasets or virtual environments you don't need on the server (or that already exist there).
+> **Why?** Without this, `easy-ssh push` would upload everything else in your project — including huge datasets or build artifacts you don't need on the server.
 
 ### Environment variables
 
 | Variable | Default | What it does |
 |----------|---------|-------------|
-| `EASY_SSH_SIZE_WARN_KB` | `512000` (~500 MB) | Refuse to sync if local directory is bigger than this |
+| `EASY_SSH_SIZE_WARN_KB` | `512000` (~500 MB) | Refuse to sync if the effective sync payload is bigger than this |
 | `EASY_SSH_CONNECT_TIMEOUT` | `5` seconds | How long to wait for SSH connection |
 | `EASY_SSH_LOG_LINES` | `50` | How many lines `easy-ssh logs` shows |
 
