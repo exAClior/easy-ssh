@@ -390,6 +390,23 @@ EOF
     assert_contains "$LAST_OUTPUT" "Refusing to sync"
 }
 
+default_excludes_tier() {
+    setup_case
+    write_config
+
+    mkdir -p "$PROJECT_DIR/.git" "$PROJECT_DIR/.venv/bin"
+    printf 'ref: refs/heads/main\n' > "$PROJECT_DIR/.git/HEAD"
+    printf '#!/usr/bin/env python\n' > "$PROJECT_DIR/.venv/bin/python"
+    dd if=/dev/zero of="$PROJECT_DIR/.venv/big.bin" bs=2048 count=2 >/dev/null 2>&1
+    printf 'tracked\n' > "$PROJECT_DIR/tracked.txt"
+
+    run_cmd "$PROJECT_DIR" env PATH="$TEST_PATH" EASY_SSH_SIZE_WARN_KB=1 "$EASY_SSH_BIN" push
+    assert_status 0
+    assert_file_equals "$REMOTE_DIR/tracked.txt" "tracked"
+    assert_file_missing "$REMOTE_DIR/.git"
+    assert_file_missing "$REMOTE_DIR/.venv"
+}
+
 push_safety_tier() {
     setup_case
     write_config
@@ -400,6 +417,9 @@ EOF
     printf 'tracked\n' > "$PROJECT_DIR/tracked.txt"
     printf 'ignore\n' > "$PROJECT_DIR/ignored.txt"
     printf 'remote-only\n' > "$REMOTE_DIR/remote-only.txt"
+    mkdir -p "$REMOTE_DIR/.git" "$REMOTE_DIR/.venv/bin"
+    printf 'ref: refs/heads/main\n' > "$REMOTE_DIR/.git/HEAD"
+    printf '#!/usr/bin/env python\n' > "$REMOTE_DIR/.venv/bin/python"
 
     run_tool "$PROJECT_DIR" push
     assert_status 0
@@ -410,13 +430,19 @@ EOF
     run_tool "$PROJECT_DIR" push --clean
     assert_status 0
     assert_contains "$LAST_OUTPUT" "remote-only.txt"
+    assert_contains "$LAST_OUTPUT" ".git"
+    assert_contains "$LAST_OUTPUT" ".venv"
     assert_contains "$LAST_OUTPUT" "Preview only"
     assert_file_exists "$REMOTE_DIR/remote-only.txt"
+    assert_file_exists "$REMOTE_DIR/.git"
+    assert_file_exists "$REMOTE_DIR/.venv"
 
     run_tool "$PROJECT_DIR" push --clean --force
     assert_status 0
     assert_file_missing "$REMOTE_DIR/remote-only.txt"
     assert_file_missing "$REMOTE_DIR/ignored.txt"
+    assert_file_missing "$REMOTE_DIR/.git"
+    assert_file_missing "$REMOTE_DIR/.venv"
 }
 
 main() {
@@ -433,6 +459,7 @@ main() {
 
     run_test "core commands" core_commands_tier
     run_test "error paths" error_paths_tier
+    run_test "default excludes" default_excludes_tier
     run_test "push safety" push_safety_tier
 
     printf '\n%d/%d tests passed\n' "$PASSED" "$TOTAL"
