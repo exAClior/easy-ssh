@@ -13,6 +13,16 @@ description: >
 
 Run local project code on a remote server via SSH. No agent or daemon needed on the server — just SSH access and rsync.
 
+## ⚠️ Default rule — read first
+
+**Default to `easy-ssh submit`. Use `easy-ssh run` only for trivial read-only probes that provably finish in under ~10 seconds** (e.g. `ls`, `cat`, `nvidia-smi`, `git status`, `which python`).
+
+Anything that **writes files, trains, downloads, compiles, runs tests, or loops over data** → `submit`, no exceptions. Do not try to predict whether a command will take "a few minutes" — you cannot, and being wrong is unrecoverable (see below).
+
+`run` blocks the agent's bash tool until completion. If the agent's bash timeout (typically 2–10 min) fires first, the SSH client is killed but the **remote process keeps running orphaned**, the agent loses all output, and the user's terminal hangs. Prefer `submit` whenever in doubt.
+
+`easy-ssh submit "<cmd>" && easy-ssh monitor` is the **drop-in replacement** for `easy-ssh run "<cmd>"`: same live output, same Ctrl+C semantics for the user, but the remote job survives if your bash tool times out.
+
 ## When to use
 
 - User wants to run a command on a remote server using local files
@@ -52,9 +62,9 @@ ls .easy-ssh.conf 2>/dev/null
 
 | User intent | Command |
 |---|---|
+| **Default: run anything substantive** | `easy-ssh submit "<cmd>"` then `easy-ssh monitor` |
+| Trivial read-only probe (<10s, no writes) | `easy-ssh run "<cmd>"` |
 | Sync files only | `easy-ssh push` |
-| Run and wait for output | `easy-ssh run "<cmd>"` |
-| Launch long job, return immediately | `easy-ssh submit "<cmd>"` |
 | Check running job output | `easy-ssh logs` |
 | Live-stream job output | `easy-ssh monitor` |
 | Check if job finished | `easy-ssh status` |
@@ -62,33 +72,37 @@ ls .easy-ssh.conf 2>/dev/null
 | Remove stale remote files | `easy-ssh clean --force` |
 | Preview what clean would delete | `easy-ssh clean` |
 
+⚠️ Reminder: `run` blocks the agent's bash tool. If the bash timeout fires before the remote command finishes, the remote process is orphaned and the agent loses all output. Use `submit` unless you are certain the command is trivial.
+
 ### Step 2 — Execute
 
-#### Sync + run (short tasks, < ~5 min)
-
-```bash
-easy-ssh run "<command>"
-```
-
-Pushes local files, runs the command, waits, returns stdout/stderr and exit code.
-Use for quick scripts, compilation, tests, data generation.
-
-#### Sync + submit (long tasks)
+#### Sync + submit (default for all substantive work)
 
 ```bash
 easy-ssh submit "<command>"
 ```
 
-Pushes local files, launches the command via nohup, returns immediately.
-Use for training runs, batch processing, anything > 5 min.
+Pushes local files, launches the command via `nohup`, returns immediately.
+Use for **training, inference, tests, compilation, downloads, data processing, batch jobs** — anything that writes files or loops over data.
 
 After submitting, monitor with:
 
 ```bash
-easy-ssh monitor  # live-stream output, auto-stops when job ends (Ctrl+C to detach)
+easy-ssh monitor  # live-stream output, auto-stops when job ends (Ctrl+C to detach safely)
 easy-ssh status   # job state: running/finished + exit code
 easy-ssh logs     # last 50 lines of output (configurable via EASY_SSH_LOG_LINES)
 ```
+
+`submit + monitor` gives the user the same experience as `run` (live output, Ctrl+C works), but the remote job survives an agent bash-tool timeout.
+
+#### Sync + run (trivial read-only probes only)
+
+```bash
+easy-ssh run "<command>"
+```
+
+Pushes local files, runs the command synchronously, waits, returns stdout/stderr and exit code.
+**Only safe for one-shot read-only checks** like `nvidia-smi`, `ls`, `cat`, `git status`, `which python`, `nvcc --version`. If the command writes files, trains, downloads, compiles, or could exceed ~10 seconds, use `submit` instead.
 
 #### Pull results back
 
@@ -143,10 +157,19 @@ node_modules/
 
 ```bash
 # 1. User edits code locally (you help with this)
-# 2. Run on server
-easy-ssh run "python train.py --epochs 10"
+# 2. Submit on server (default for anything substantive)
+easy-ssh submit "python train.py --epochs 10"
+easy-ssh monitor                       # live output, Ctrl+C detaches safely
+easy-ssh status                        # confirm finished + exit code
 # 3. Pull output
 easy-ssh pull results/metrics.json
+```
+
+### Trivial probe (the only legitimate `run` use)
+
+```bash
+easy-ssh run "nvidia-smi"              # one-shot read-only check
+easy-ssh run "which python && python --version"
 ```
 
 ### Long training with checkpoints
@@ -162,8 +185,10 @@ easy-ssh pull checkpoints/             # grab all checkpoints
 ### Julia project
 
 ```bash
-easy-ssh run "julia --project=. -e 'using Pkg; Pkg.instantiate()'"
-easy-ssh run "julia --project=. src/main.jl"
+easy-ssh submit "julia --project=. -e 'using Pkg; Pkg.instantiate()'"
+easy-ssh monitor
+easy-ssh submit "julia --project=. src/main.jl"
+easy-ssh monitor
 easy-ssh pull output/
 ```
 
