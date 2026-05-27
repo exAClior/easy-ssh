@@ -11,9 +11,11 @@ SSH_CONNECT_TIMEOUT=${EASY_SSH_CONNECT_TIMEOUT:-5}
 LOG_LINES=${EASY_SSH_LOG_LINES:-50}
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT")
 
+remote_name=""
 host=""
 remote_dir=""
 remote_dir_real=""
+config_remote=""
 DEFAULT_EXCLUDES=(.git .venv)
 RSYNC_ARGS=()
 RSYNC_SIZE_ARGS=()
@@ -21,15 +23,18 @@ RSYNC_SIZE_ARGS=()
 usage() {
     cat <<EOF
 Usage:
-  $PROGRAM init
-  $PROGRAM push [--clean] [--force]
-  $PROGRAM run "<cmd>"
-  $PROGRAM submit "<cmd>"
-  $PROGRAM logs
-  $PROGRAM monitor
-  $PROGRAM pull <path>
-  $PROGRAM clean [--force]
-  $PROGRAM status
+  $PROGRAM [--remote NAME] init
+  $PROGRAM [--remote NAME] push [--clean] [--force]
+  $PROGRAM [--remote NAME] run "<cmd>"
+  $PROGRAM [--remote NAME] submit "<cmd>"
+  $PROGRAM [--remote NAME] logs
+  $PROGRAM [--remote NAME] monitor
+  $PROGRAM [--remote NAME] pull <path>
+  $PROGRAM [--remote NAME] clean [--force]
+  $PROGRAM [--remote NAME] status
+
+Options:
+  -r, --remote NAME  Select a named remote section from $CONFIG_FILE
 
 Commands:
   init           Interactive setup for .easy-ssh.conf
@@ -88,18 +93,99 @@ parse_config_value() {
     printf '%s' "$value"
 }
 
-load_config() {
-    local line raw
+validate_remote_name() {
+    local name="$1"
 
-    [[ -f "$CONFIG_FILE" ]] || die "no $CONFIG_FILE found. Run '$PROGRAM init' first"
+    [[ -n $name ]] || die "remote name is required"
+    [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid remote name '$name' (use letters, numbers, dot, underscore, or dash)"
+}
 
-    host=""
-    remote_dir=""
+config_has_sections() {
+    local line header len
+
+    [[ -f "$CONFIG_FILE" ]] || return 1
 
     while IFS= read -r line || [[ -n $line ]]; do
         line=$(trim "$line")
         [[ -z $line || ${line:0:1} == '#' ]] && continue
 
+        header=${line%%#*}
+        header=$(trim "$header")
+        [[ ${header:0:1} == '[' ]] || continue
+
+        len=${#header}
+        [[ $len -ge 3 && ${header:$((len-1)):1} == ']' ]] && return 0
+    done < "$CONFIG_FILE"
+
+    return 1
+}
+
+write_named_remote_config() {
+    local name="$1"
+    local input_host="$2"
+    local input_remote_dir="$3"
+    local tmp line trimmed header len section skip=0
+
+    tmp=$(mktemp "${CONFIG_FILE}.XXXXXX") || die "failed to create temporary config"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            trimmed=$(trim "$line")
+            header=${trimmed%%#*}
+            header=$(trim "$header")
+
+            if [[ ${header:0:1} == '[' ]]; then
+                len=${#header}
+                if [[ $len -ge 3 && ${header:$((len-1)):1} == ']' ]]; then
+                    section=${header:1:$((len-2))}
+                    section=$(trim "$section")
+                    if [[ $section == "$name" ]]; then
+                        skip=1
+                        continue
+                    fi
+                    skip=0
+                fi
+            fi
+
+            (( skip )) && continue
+            printf '%s\n' "$line" >> "$tmp"
+        done < "$CONFIG_FILE"
+    fi
+
+    [[ ! -s $tmp ]] || printf '\n' >> "$tmp"
+    cat >> "$tmp" <<EOF
+[$name]
+host=$(quote_config_value "$input_host")
+remote_dir=$(quote_config_value "$input_remote_dir")
+EOF
+    mv -- "$tmp" "$CONFIG_FILE"
+}
+
+load_named_remote_defaults() {
+    local name="$1"
+    local line raw header len section="" found=0
+
+    host=""
+    remote_dir=""
+    [[ -f "$CONFIG_FILE" ]] || return 1
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=$(trim "$line")
+        [[ -z $line || ${line:0:1} == '#' ]] && continue
+
+        header=${line%%#*}
+        header=$(trim "$header")
+        if [[ ${header:0:1} == '[' ]]; then
+            len=${#header}
+            [[ $len -ge 3 && ${header:$((len-1)):1} == ']' ]] || die "malformed remote section header in $CONFIG_FILE: $line"
+            section=${header:1:$((len-2))}
+            section=$(trim "$section")
+            validate_remote_name "$section"
+            [[ $section == "$name" ]] && found=1 || found=0
+            continue
+        fi
+
+        (( found )) || continue
         case "$line" in
             host=*)
                 raw=${line#host=}
@@ -112,8 +198,110 @@ load_config() {
         esac
     done < "$CONFIG_FILE"
 
-    [[ -n $host ]] || die "'host' not set in $CONFIG_FILE"
-    [[ -n $remote_dir ]] || die "'remote_dir' not set in $CONFIG_FILE"
+    [[ -n $host || -n $remote_dir ]]
+}
+
+load_config() {
+    local line raw header len section=""
+    local top_host="" top_remote_dir=""
+    local selected_host="" selected_remote_dir="" selected_found=0
+    local section_count=0 section_names="" seen_sections=$'\n'
+    local only_name="" only_host="" only_remote_dir=""
+
+    [[ -f "$CONFIG_FILE" ]] || die "no $CONFIG_FILE found. Run '$PROGRAM init' first"
+
+    host=""
+    remote_dir=""
+    config_remote=""
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=$(trim "$line")
+        [[ -z $line || ${line:0:1} == '#' ]] && continue
+
+        header=${line%%#*}
+        header=$(trim "$header")
+        if [[ ${header:0:1} == '[' ]]; then
+            len=${#header}
+            [[ $len -ge 3 && ${header:$((len-1)):1} == ']' ]] || die "malformed remote section header in $CONFIG_FILE: $line"
+            section=${header:1:$((len-2))}
+            section=$(trim "$section")
+            validate_remote_name "$section"
+
+            case "$seen_sections" in
+                *$'\n'"$section"$'\n'*) die "duplicate remote '$section' in $CONFIG_FILE" ;;
+            esac
+            seen_sections="$seen_sections$section"$'\n'
+
+            section_count=$((section_count + 1))
+            if [[ -z $section_names ]]; then
+                section_names=$section
+            else
+                section_names="$section_names, $section"
+            fi
+
+            if (( section_count == 1 )); then
+                only_name=$section
+                only_host=""
+                only_remote_dir=""
+            fi
+            [[ -n $remote_name && $section == "$remote_name" ]] && selected_found=1
+            continue
+        fi
+
+        case "$line" in
+            host=*)
+                raw=${line#host=}
+                if [[ -z $section ]]; then
+                    top_host=$(parse_config_value "$raw")
+                else
+                    [[ $section == "$remote_name" ]] && selected_host=$(parse_config_value "$raw")
+                    (( section_count == 1 )) && only_host=$(parse_config_value "$raw")
+                fi
+                ;;
+            remote_dir=*)
+                raw=${line#remote_dir=}
+                if [[ -z $section ]]; then
+                    top_remote_dir=$(parse_config_value "$raw")
+                else
+                    [[ $section == "$remote_name" ]] && selected_remote_dir=$(parse_config_value "$raw")
+                    (( section_count == 1 )) && only_remote_dir=$(parse_config_value "$raw")
+                fi
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    if [[ -n $remote_name ]]; then
+        (( selected_found )) || die "remote '$remote_name' not found in $CONFIG_FILE${section_names:+ (available: $section_names)}"
+        [[ -n $selected_host ]] || die "'host' not set for remote '$remote_name' in $CONFIG_FILE"
+        [[ -n $selected_remote_dir ]] || die "'remote_dir' not set for remote '$remote_name' in $CONFIG_FILE"
+        host=$selected_host
+        remote_dir=$selected_remote_dir
+        config_remote=$remote_name
+        return 0
+    fi
+
+    if [[ -n $top_host || -n $top_remote_dir ]]; then
+        [[ -n $top_host ]] || die "'host' not set in $CONFIG_FILE"
+        [[ -n $top_remote_dir ]] || die "'remote_dir' not set in $CONFIG_FILE"
+        host=$top_host
+        remote_dir=$top_remote_dir
+        return 0
+    fi
+
+    if (( section_count == 1 )); then
+        [[ -n $only_host ]] || die "'host' not set for remote '$only_name' in $CONFIG_FILE"
+        [[ -n $only_remote_dir ]] || die "'remote_dir' not set for remote '$only_name' in $CONFIG_FILE"
+        host=$only_host
+        remote_dir=$only_remote_dir
+        config_remote=$only_name
+        return 0
+    fi
+
+    if (( section_count > 1 )); then
+        die "multiple remotes in $CONFIG_FILE; pass --remote NAME (available: $section_names)"
+    fi
+
+    die "'host' not set in $CONFIG_FILE"
 }
 
 quote_config_value() {
@@ -290,14 +478,24 @@ do_init() {
     local current_remote_dir=""
     local input_host input_remote_dir
 
-    if [[ -f "$CONFIG_FILE" ]]; then
-        if load_config >/dev/null 2>&1; then
+    [[ $# -eq 0 ]] || die "usage: $PROGRAM [--remote NAME] init"
+
+    if [[ -n $remote_name ]]; then
+        validate_remote_name "$remote_name"
+        if load_named_remote_defaults "$remote_name"; then
             current_host=$host
             current_remote_dir=$remote_dir
         fi
+    elif config_has_sections; then
+        die "$CONFIG_FILE contains named remotes; use '$PROGRAM --remote NAME init' to add or update one"
+    elif [[ -f "$CONFIG_FILE" ]]; then
+        load_config
+        current_host=$host
+        current_remote_dir=$remote_dir
     fi
 
     printf 'SSH host'
+    [[ -n $remote_name ]] && printf ' for remote %s' "$remote_name"
     [[ -n $current_host ]] && printf ' [%s]' "$current_host"
     printf ': '
     IFS= read -r input_host
@@ -312,10 +510,14 @@ do_init() {
     [[ -n $input_host ]] || die "host is required"
     [[ -n $input_remote_dir ]] || die "remote directory is required"
 
-    cat > "$CONFIG_FILE" <<EOF
+    if [[ -n $remote_name ]]; then
+        write_named_remote_config "$remote_name" "$input_host" "$input_remote_dir"
+    else
+        cat > "$CONFIG_FILE" <<EOF
 host=$(quote_config_value "$input_host")
 remote_dir=$(quote_config_value "$input_remote_dir")
 EOF
+    fi
 
     info "wrote $CONFIG_FILE"
     if [[ ! -f "$IGNORE_FILE" ]]; then
@@ -444,6 +646,7 @@ EOF
 do_logs() {
     local rc
 
+    [[ $# -eq 0 ]] || die "usage: $PROGRAM [--remote NAME] logs"
     require_local_tools ssh tail
     load_config
     ensure_ssh_connection
@@ -474,6 +677,7 @@ EOF
 do_monitor() {
     local rc
 
+    [[ $# -eq 0 ]] || die "usage: $PROGRAM [--remote NAME] monitor"
     require_local_tools ssh
     load_config
     ensure_ssh_connection
@@ -590,9 +794,11 @@ do_clean() {
 do_status() {
     local rc
 
+    [[ $# -eq 0 ]] || die "usage: $PROGRAM [--remote NAME] status"
     require_local_tools ssh
     load_config
 
+    [[ -z $config_remote ]] || info "remote: $config_remote"
     info "host: $host"
     info "remote_dir: $remote_dir"
 
@@ -642,7 +848,39 @@ EOF
 }
 
 main() {
-    local command=${1:-}
+    local command
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--remote)
+                [[ $# -ge 2 ]] || die "missing value for $1"
+                remote_name=$2
+                validate_remote_name "$remote_name"
+                shift 2
+                ;;
+            --remote=*)
+                remote_name=${1#--remote=}
+                validate_remote_name "$remote_name"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -h|--help|help|"")
+                usage
+                return 0
+                ;;
+            -*)
+                die "unknown global option: $1"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    command=${1:-}
 
     case "$command" in
         init)

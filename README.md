@@ -117,7 +117,7 @@ chmod +x ~/.local/bin/easy-ssh
 easy-ssh --help
 ```
 
-You should see a usage summary starting with `Usage: easy-ssh init ...`. If you get `command not found`, your PATH doesn't include the install location — go back to Step 3.
+You should see a usage summary starting with `Usage:` and `easy-ssh [--remote NAME] init`. If you get `command not found`, your PATH doesn't include the install location — go back to Step 3.
 
 ### Step 5 — Set up your first project
 
@@ -238,6 +238,35 @@ remote_dir='~/projects/my-project'
 
 You can edit this file by hand if you need to change the host or path.
 
+For multiple remotes in the same project, use named sections:
+
+```bash
+[a800]
+host='a800'
+remote_dir='~/projects/my-project'
+
+[h100]
+host='h100'
+remote_dir='~/projects/my-project'
+```
+
+Then select one explicitly:
+
+```bash
+easy-ssh --remote h100 status
+easy-ssh -r a800 submit "python train.py"
+```
+
+If the config has exactly one named remote, `easy-ssh` uses it by default. If it has multiple named remotes and no top-level `host` / `remote_dir`, pass `--remote NAME`. A top-level `host` / `remote_dir` remains the default for old configs.
+
+To add or update a named remote interactively:
+
+```bash
+easy-ssh --remote h100 init
+```
+
+Remote names may contain letters, numbers, `.`, `_`, and `-`.
+
 ### `.easy-ssh-ignore`
 
 Controls what **else** doesn't get synced to the server. Same syntax as `.gitignore`.
@@ -305,6 +334,7 @@ The integration test boots a temporary localhost `sshd`, points `easy-ssh` at a 
 - core commands (`init`, `push`, `run`, `submit`, `pull`, `logs`, `status`, `clean`)
 - error paths (missing config, bad host, oversized directories)
 - push safety (ignore files, `--clean` preview, `--force` execution)
+- multiple remotes in one config (`--remote`, named sections, named `init`)
 
 ---
 

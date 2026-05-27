@@ -44,19 +44,31 @@ Anything that **writes files, trains, downloads, compiles, runs tests, or loops 
 ls .easy-ssh.conf 2>/dev/null
 ```
 
-- **File exists**: read it to learn `host` and `remote_dir`, then skip to the relevant command.
+- **File exists**: read it to learn the remote config.
+  - Flat config means the default remote:
+    ```bash
+    host='<ssh-host>'
+    remote_dir='<remote-path>'
+    ```
+  - Named sections mean multiple remotes in one config:
+    ```bash
+    [a800]
+    host='a800'
+    remote_dir='~/projects/mypackage'
+
+    [h100]
+    host='h100'
+    remote_dir='~/projects/mypackage'
+    ```
+  - If multiple named remotes exist, pick the one the user asked for and add `--remote NAME` immediately after `easy-ssh` on every command, e.g. `easy-ssh --remote h100 status`. If the user did not specify which remote, ask before running anything destructive or long-running.
+  - If exactly one named remote exists, `easy-ssh` can use it without `--remote`.
+  - If top-level `host` / `remote_dir` exists alongside sections, it is the default remote.
 - **File missing**: the project hasn't been initialized yet. Ask the user for:
   1. SSH host (as configured in `~/.ssh/config`)
   2. Remote directory path (e.g., `~/projects/mypackage`)
+  3. Optional remote name, if they want multiple remotes in one config
 
-  Then run `easy-ssh init` interactively, or create `.easy-ssh.conf` directly:
-
-  ```bash
-  cat > .easy-ssh.conf <<'EOF'
-  host='<user-provided-host>'
-  remote_dir='<user-provided-path>'
-  EOF
-  ```
+  Then run `easy-ssh init` for a flat default remote, or `easy-ssh --remote <name> init` for a named remote. You may also create `.easy-ssh.conf` directly with either shape above.
 
 ### Step 1 — Determine the right command
 

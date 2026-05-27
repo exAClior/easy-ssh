@@ -445,6 +445,109 @@ EOF
     assert_file_missing "$REMOTE_DIR/.venv"
 }
 
+multiple_remotes_tier() {
+    local remote_one remote_two remote_updated
+
+    setup_case
+    remote_one=$REMOTE_DIR
+    remote_two="$CASE_DIR/remote-two"
+    mkdir -p "$remote_two"
+
+    cat > "$PROJECT_DIR/.easy-ssh.conf" <<EOF
+[one]
+host='$SSH_TEST_HOST'
+remote_dir='$remote_one'
+
+[two]
+host='$SSH_TEST_HOST'
+remote_dir='$remote_two'
+EOF
+    printf 'multi-one\n' > "$PROJECT_DIR/multi.txt"
+
+    run_tool "$PROJECT_DIR" status
+    assert_status 1
+    assert_contains "$LAST_OUTPUT" "multiple remotes"
+
+    run_tool "$PROJECT_DIR" status --remote one
+    assert_status 1
+    assert_contains "$LAST_OUTPUT" "usage:"
+
+    run_tool "$PROJECT_DIR" --remote=two status
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "remote: two"
+
+    run_tool "$PROJECT_DIR" --remote missing status
+    assert_status 1
+    assert_contains "$LAST_OUTPUT" "remote 'missing' not found"
+
+    run_tool "$PROJECT_DIR" --remote one push
+    assert_status 0
+    assert_file_equals "$remote_one/multi.txt" "multi-one"
+    assert_file_missing "$remote_two/multi.txt"
+
+    printf 'multi-two\n' > "$PROJECT_DIR/multi.txt"
+    run_tool "$PROJECT_DIR" -r two run "cat multi.txt"
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "multi-two"
+    assert_file_equals "$remote_two/multi.txt" "multi-two"
+
+    setup_case
+    remote_two="$CASE_DIR/remote-two"
+    mkdir -p "$remote_two"
+    cat > "$PROJECT_DIR/.easy-ssh.conf" <<EOF
+host='$SSH_TEST_HOST'
+remote_dir='$REMOTE_DIR'
+
+[other]
+host='no-such-host.invalid'
+remote_dir='$remote_two'
+EOF
+    run_tool "$PROJECT_DIR" status
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "host: $SSH_TEST_HOST"
+
+    setup_case
+    run_tool_input "$PROJECT_DIR" "$SSH_TEST_HOST\n$REMOTE_DIR\n" --remote gpu init
+    assert_status 0
+    assert_file_contains "$PROJECT_DIR/.easy-ssh.conf" "[gpu]"
+    assert_file_contains "$PROJECT_DIR/.easy-ssh.conf" "host='$SSH_TEST_HOST'"
+    assert_file_contains "$PROJECT_DIR/.easy-ssh.conf" "remote_dir='$REMOTE_DIR'"
+
+    remote_updated="$CASE_DIR/remote-updated"
+    mkdir -p "$remote_updated"
+    run_tool_input "$PROJECT_DIR" "\n$remote_updated\n" --remote gpu init
+    assert_status 0
+    assert_file_contains "$PROJECT_DIR/.easy-ssh.conf" "host='$SSH_TEST_HOST'"
+    assert_file_contains "$PROJECT_DIR/.easy-ssh.conf" "remote_dir='$remote_updated'"
+
+    run_tool "$PROJECT_DIR" status
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "remote: gpu"
+
+    setup_case
+    cat > "$PROJECT_DIR/.easy-ssh.conf" <<EOF
+[dup]
+host='$SSH_TEST_HOST'
+remote_dir='$REMOTE_DIR'
+
+[dup]
+host='$SSH_TEST_HOST'
+remote_dir='$REMOTE_DIR'
+EOF
+    run_tool "$PROJECT_DIR" --remote dup status
+    assert_status 1
+    assert_contains "$LAST_OUTPUT" "duplicate remote 'dup'"
+
+    cat > "$PROJECT_DIR/.easy-ssh.conf" <<EOF
+[bad name]
+host='$SSH_TEST_HOST'
+remote_dir='$REMOTE_DIR'
+EOF
+    run_tool "$PROJECT_DIR" status
+    assert_status 1
+    assert_contains "$LAST_OUTPUT" "invalid remote name"
+}
+
 main() {
     require_tools
     [[ -x $EASY_SSH_BIN ]] || {
@@ -461,6 +564,7 @@ main() {
     run_test "error paths" error_paths_tier
     run_test "default excludes" default_excludes_tier
     run_test "push safety" push_safety_tier
+    run_test "multiple remotes" multiple_remotes_tier
 
     printf '\n%d/%d tests passed\n' "$PASSED" "$TOTAL"
     [[ $FAILED -eq 0 ]]
