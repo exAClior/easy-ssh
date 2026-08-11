@@ -117,7 +117,7 @@ chmod +x ~/.local/bin/easy-ssh
 easy-ssh --help
 ```
 
-You should see a usage summary starting with `Usage:` and `easy-ssh [--remote NAME] init`. If you get `command not found`, your PATH doesn't include the install location — go back to Step 3.
+You should see a summary beginning with `Usage: easy-ssh [--remote NAME] <command> [arguments]`. If you get `command not found`, your PATH doesn't include the install location — go back to Step 3.
 
 ### Step 5 — Set up your first project
 
@@ -176,26 +176,24 @@ All commands below assume you are inside your project directory (the one with `.
 | `easy-ssh init` | Interactive setup → writes `.easy-ssh.conf` |
 | `easy-ssh push` | Sync local dir → remote (additive-only, won't delete remote files) |
 | `easy-ssh push --clean` | Sync with deletion of remote-only files (preview first, `--force` to execute) |
-| `easy-ssh run "<cmd>"` | Push + execute on remote, **wait** for completion, show output |
-| `easy-ssh submit "<cmd>"` | Push + launch in background, **return immediately** (for long jobs) |
+| `easy-ssh run "<cmd>"` | Run a trivial read-only probe and wait for output |
+| `easy-ssh submit "<cmd>"` | Push + launch durably in the background, **return immediately** |
 | `easy-ssh logs` | Tail the remote log from the last `submit` |
 | `easy-ssh monitor` | Live-stream job output in real time; auto-stops when job ends |
 | `easy-ssh pull <path>` | Fetch remote files back to your laptop |
 | `easy-ssh clean` | Show remote-only files; `--force` to remove them |
 | `easy-ssh status` | Show config, test SSH connection, check running jobs |
 
-### Example: quick script
+### Example: trivial read-only probe
 
 ```bash
-# You write a script locally (with your LLM helping you)
-# Then run it on the server:
-easy-ssh run "python generate_data.py"
-
-# Grab the output files:
-easy-ssh pull results/
+easy-ssh run "nvidia-smi"
+easy-ssh run "python --version"
 ```
 
-`run` does three things in order: (1) syncs your files to the server, (2) runs the command, (3) shows you the output. It **waits** until the command finishes.
+`run` syncs first and waits for the remote command. Use it only for read-only
+checks that reliably finish in about 10 seconds. Compilation, tests, downloads,
+data generation, and any command that writes files belong in `submit`.
 
 ### Example: long training job
 
@@ -218,10 +216,35 @@ easy-ssh pull results/metrics.json
 ### Example: Julia project
 
 ```bash
-easy-ssh run "julia --project=. -e 'using Pkg; Pkg.instantiate()'"
-easy-ssh run "julia --project=. src/main.jl"
+easy-ssh submit "julia --project=. -e 'using Pkg; Pkg.instantiate()'"
+easy-ssh monitor
+easy-ssh submit "julia --project=. src/main.jl"
+easy-ssh monitor
 easy-ssh pull output/
 ```
+
+### Built-in progressive help
+
+The default help stays compact and points to focused topics:
+
+```bash
+easy-ssh --help
+easy-ssh --help getting-started
+easy-ssh --help jobs
+easy-ssh --help configuration
+easy-ssh --help troubleshooting
+```
+
+The standalone CLI also carries the complete Agent Skill. Export it without
+cloning this repository:
+
+```bash
+mkdir -p ~/.config/agents/skills/easy-ssh
+easy-ssh --help skill > ~/.config/agents/skills/easy-ssh/SKILL.md
+```
+
+`easy-ssh --help skill` is deliberately explicit: ordinary help invocations do
+not print the full skill.
 
 ---
 
@@ -288,8 +311,15 @@ node_modules/
 | Variable | Default | What it does |
 |----------|---------|-------------|
 | `EASY_SSH_SIZE_WARN_KB` | `512000` (~500 MB) | Refuse to sync if the effective sync payload is bigger than this |
-| `EASY_SSH_CONNECT_TIMEOUT` | `5` seconds | How long to wait for SSH connection |
+| `EASY_SSH_CONNECT_TIMEOUT` | `30` seconds | How long to wait for SSH connection and banner exchange |
+| `EASY_SSH_CONTROL_PERSIST` | `10m` | How long the multiplexed SSH master remains reusable |
+| `EASY_SSH_CONTROL_DIR` | `~/.ssh/easy-ssh-control` | Private directory for SSH control sockets |
 | `EASY_SSH_LOG_LINES` | `50` | How many lines `easy-ssh logs` shows |
+
+`easy-ssh` enables OpenSSH `ControlMaster=auto` and `ControlPersist`, and passes
+the same SSH command to rsync. A command's connectivity check, path resolution,
+sync, launch, and monitoring can therefore reuse one authenticated connection
+instead of repeating the proxy and banner exchange at every step.
 
 ---
 
@@ -301,7 +331,7 @@ If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code), you ca
 npx skills add exAClior/easy-ssh --skill easy-ssh
 ```
 
-Once installed, you can say things like *"run train.py on the server"* and Claude Code will handle the `push`, `run`, and `pull` for you.
+Once installed, you can say things like *"run train.py on the server"* and Claude Code will handle durable `submit`, monitoring, and result retrieval for you.
 
 ---
 
@@ -332,6 +362,7 @@ rm .easy-ssh.conf .easy-ssh-ignore .easy-ssh-log .easy-ssh-status
 The integration test boots a temporary localhost `sshd`, points `easy-ssh` at a temp directory, and covers:
 
 - core commands (`init`, `push`, `run`, `submit`, `pull`, `logs`, `status`, `clean`)
+- progressive help, exact embedded-skill export, and SSH control-socket creation
 - error paths (missing config, bad host, oversized directories)
 - push safety (ignore files, `--clean` preview, `--force` execution)
 - multiple remotes in one config (`--remote`, named sections, named `init`)

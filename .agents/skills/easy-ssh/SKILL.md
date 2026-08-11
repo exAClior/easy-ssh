@@ -1,187 +1,172 @@
 ---
 name: easy-ssh
 description: >
-  Use the easy-ssh CLI to run computations on a remote server using local project files.
-  Trigger when the user asks to run code remotely, execute on a server, submit a job,
-  sync files to a remote machine, pull results from a server, check remote job status,
-  or mentions "easy-ssh", "remote run", "server-side", "GPU server", or "cluster".
-  Also trigger when the user has a local project and wants to execute it somewhere
-  with more compute (GPU, RAM, CPU cores).
+  Runs local project code on remote machines through the easy-ssh CLI. Use when
+  asked to execute on a server, submit a durable job, use a GPU or CPU cluster,
+  sync or pull project files, inspect remote logs, or check remote job status.
 ---
 
-# easy-ssh — Remote Execution Skill
+# easy-ssh — Remote Execution
 
-Run local project code on a remote server via SSH. No agent or daemon needed on the server — just SSH access and rsync.
+Run local project code on a remote server through SSH and rsync. Keep editing and
+agent work local; submit compute to the configured host.
 
-## When to use
+## Default rule
 
-- User wants to run a command on a remote server using local files
-- User mentions "run this on the server", "submit a job", "GPU", "cluster", "remote"
-- User wants to sync code, pull results, or check job status
-- Project already has `.easy-ssh.conf` (check with `ls .easy-ssh.conf`)
+**Use `easy-ssh submit` for all substantive work. Use `easy-ssh run` only for a
+trivial read-only probe that will finish in about 10 seconds.**
+
+Compilation, tests, training, downloads, data processing, file writes, and loops
+belong in `submit`, even when they are expected to be quick. A blocking `run` can
+outlive the invoking tool timeout and leave an untracked remote process.
+
+```bash
+easy-ssh submit "<command>"
+easy-ssh monitor
+```
+
+The submitted job runs under `nohup`; Ctrl+C or an SSH interruption only detaches
+monitoring and does not stop the remote job.
 
 ## Prerequisites
 
-- `easy-ssh` CLI must be on PATH (check: `which easy-ssh`)
-- SSH key-based auth configured in `~/.ssh/config` for the target host
-- `rsync` available locally and on the server
+- `easy-ssh`, `ssh`, and `rsync` are available locally.
+- Key-based, non-interactive SSH works for the configured host.
+- The remote machine has `rsync`.
 
 ## Workflow
 
-### Step 0 — Detect setup state
+### 1. Inspect configuration
 
 ```bash
 ls .easy-ssh.conf 2>/dev/null
 ```
 
-- **File exists**: read it to learn the remote config.
-  - Flat config means the default remote:
-    ```bash
-    host='<ssh-host>'
-    remote_dir='<remote-path>'
-    ```
-  - Named sections mean multiple remotes in one config:
-    ```bash
-    [a800]
-    host='a800'
-    remote_dir='~/projects/mypackage'
+A default remote uses:
 
-    [h100]
-    host='h100'
-    remote_dir='~/projects/mypackage'
-    ```
-  - If multiple named remotes exist, pick the one the user asked for and add `--remote NAME` immediately after `easy-ssh` on every command, e.g. `easy-ssh --remote h100 status`. If the user did not specify which remote, ask before running anything destructive or long-running.
-  - If exactly one named remote exists, `easy-ssh` can use it without `--remote`.
-  - If top-level `host` / `remote_dir` exists alongside sections, it is the default remote.
-- **File missing**: the project hasn't been initialized yet. Ask the user for:
-  1. SSH host (as configured in `~/.ssh/config`)
-  2. Remote directory path (e.g., `~/projects/mypackage`)
-  3. Optional remote name, if they want multiple remotes in one config
+```bash
+host='<ssh-host>'
+remote_dir='<remote-path>'
+```
 
-  Then run `easy-ssh init` for a flat default remote, or `easy-ssh --remote <name> init` for a named remote. You may also create `.easy-ssh.conf` directly with either shape above.
+Multiple remotes use named sections:
 
-### Step 1 — Determine the right command
+```bash
+[a800]
+host='a800'
+remote_dir='~/projects/mypackage'
 
-| User intent | Command |
+[h100]
+host='h100'
+remote_dir='~/projects/mypackage'
+```
+
+- Put `--remote NAME` immediately after `easy-ssh` when selecting a named remote:
+  `easy-ssh --remote h100 status`.
+- One named remote is selected automatically.
+- With multiple named remotes and no default, ask which remote to use before
+  destructive or long-running work.
+- If configuration is missing, ask for the SSH host, remote directory, and
+  optional remote name, then run `easy-ssh init` or
+  `easy-ssh --remote <name> init`.
+
+### 2. Choose the operation
+
+| Intent | Command |
 |---|---|
-| Sync files only | `easy-ssh push` |
-| Run and wait for output | `easy-ssh run "<cmd>"` |
-| Launch long job, return immediately | `easy-ssh submit "<cmd>"` |
-| Check running job output | `easy-ssh logs` |
-| Live-stream job output | `easy-ssh monitor` |
-| Check if job finished | `easy-ssh status` |
-| Fetch result files locally | `easy-ssh pull <relative-path>` |
-| Remove stale remote files | `easy-ssh clean --force` |
-| Preview what clean would delete | `easy-ssh clean` |
+| Substantive command | `easy-ssh submit "<cmd>"` |
+| Stream submitted output | `easy-ssh monitor` |
+| Snapshot recent output | `easy-ssh logs` |
+| Check job and SSH state | `easy-ssh status` |
+| Trivial read-only probe | `easy-ssh run "<cmd>"` |
+| Sync only | `easy-ssh push` |
+| Fetch an artifact | `easy-ssh pull <relative-path>` |
+| Preview remote cleanup | `easy-ssh clean` |
+| Apply remote cleanup | `easy-ssh clean --force` |
 
-### Step 2 — Execute
-
-#### Sync + run (short tasks, < ~5 min)
+### 3. Submit and observe durable work
 
 ```bash
-easy-ssh run "<command>"
+easy-ssh submit "python train.py --epochs 10"
+easy-ssh monitor
+easy-ssh status
+easy-ssh logs
 ```
 
-Pushes local files, runs the command, waits, returns stdout/stderr and exit code.
-Use for quick scripts, compilation, tests, data generation.
+Treat control-channel and job state separately:
 
-#### Sync + submit (long tasks)
+- A failed `status`, `logs`, or `monitor` connection does **not** imply job
+  failure. Wait briefly and check again.
+- Do not repeat an uncertain submission until `status` confirms whether a job is
+  already running.
+- Report a job as launched only after `submit` prints its PID.
+- Report completion only from a final status/exit code, not from a dropped SSH
+  connection.
+
+### 4. Pull results
 
 ```bash
-easy-ssh submit "<command>"
+easy-ssh pull results/metrics.json
+easy-ssh pull checkpoints/
 ```
 
-Pushes local files, launches the command via nohup, returns immediately.
-Use for training runs, batch processing, anything > 5 min.
+Pull paths are relative to `remote_dir`; absolute paths and `..` are rejected.
 
-After submitting, monitor with:
+## Connection behavior
 
-```bash
-easy-ssh monitor  # live-stream output, auto-stops when job ends (Ctrl+C to detach)
-easy-ssh status   # job state: running/finished + exit code
-easy-ssh logs     # last 50 lines of output (configurable via EASY_SSH_LOG_LINES)
-```
+`easy-ssh` waits up to 30 seconds for SSH connection and banner exchange by
+default. It uses OpenSSH `ControlMaster=auto` and a 10-minute `ControlPersist` so
+the preflight, path resolution, rsync, launch, and monitoring operations can
+reuse one authenticated connection.
 
-#### Pull results back
+The control socket is stored in a private local directory. These settings are
+configurable:
 
-```bash
-easy-ssh pull <path>
-```
+| Variable | Default | Purpose |
+|---|---:|---|
+| `EASY_SSH_CONNECT_TIMEOUT` | `30` | SSH connect/banner timeout in seconds |
+| `EASY_SSH_CONTROL_PERSIST` | `10m` | Master connection lifetime |
+| `EASY_SSH_CONTROL_DIR` | `~/.ssh/easy-ssh-control` | Private control socket directory |
+| `EASY_SSH_SIZE_WARN_KB` | `512000` | Effective sync-size refusal threshold |
+| `EASY_SSH_LOG_LINES` | `50` | Lines printed by `logs` |
 
-`<path>` is relative to the remote project directory. Examples:
-
-```bash
-easy-ssh pull results/model.pkl
-easy-ssh pull output/                  # whole directory
-easy-ssh pull checkpoints/epoch_10.pt
-```
-
-**Constraints**: path must be relative, no `../` allowed.
-
-### Step 3 — Report to user
-
-- For `run`: show the command output and exit code.
-- For `submit`: confirm job launched, remind user to check `easy-ssh status` / `easy-ssh logs`.
-- For `pull`: confirm files fetched, show local path.
-- On failure: show the error message. Common issues:
-  - `ssh connection failed` → check host in `~/.ssh/config`, key auth
-  - `directory is XXXmb` → add patterns to `.easy-ssh-ignore` or use `--force`
-  - `job already running` → wait for it or kill via `easy-ssh run "kill <pid>"`
+For an intermittent proxied host, prefer a larger timeout over rapid repeated
+connections. Do not add blind retries around `run` or `submit`, because their
+remote outcome can be ambiguous.
 
 ## File exclusions
 
-`easy-ssh` already skips `.git` and `.venv` automatically.
+`.git` and `.venv` are always excluded. Add project-specific local-only files to
+`.easy-ssh-ignore` using gitignore-style patterns:
 
-If the project has other large local-only files that shouldn't sync (datasets, build artifacts, caches), create `.easy-ssh-ignore` with gitignore-style patterns:
-
-```
+```text
 __pycache__/
 *.pyc
 data/
 node_modules/
 ```
 
-## Environment variables
+`clean` is a dry run. Use `clean --force` only after reviewing its deletion list.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `EASY_SSH_SIZE_WARN_KB` | 512000 | Warn if effective sync size exceeds this (KB) |
-| `EASY_SSH_CONNECT_TIMEOUT` | 5 | SSH timeout (seconds) |
-| `EASY_SSH_LOG_LINES` | 50 | Lines shown by `logs` |
+## Progressive CLI guidance
 
-## Common patterns
-
-### Edit locally → run remotely → pull results
+Load only the focused help needed for the current task:
 
 ```bash
-# 1. User edits code locally (you help with this)
-# 2. Run on server
-easy-ssh run "python train.py --epochs 10"
-# 3. Pull output
-easy-ssh pull results/metrics.json
+easy-ssh --help getting-started
+easy-ssh --help jobs
+easy-ssh --help configuration
+easy-ssh --help troubleshooting
 ```
 
-### Long training with checkpoints
+`easy-ssh --help skill` emits this complete installable `SKILL.md`. Do not call it
+after this skill is already loaded unless verifying or exporting the canonical
+skill text.
 
-```bash
-easy-ssh submit "python train.py --epochs 100 --save-every 10"
-# ... later ...
-easy-ssh logs                          # check progress
-easy-ssh status                        # check if done
-easy-ssh pull checkpoints/             # grab all checkpoints
-```
+## Reporting
 
-### Julia project
-
-```bash
-easy-ssh run "julia --project=. -e 'using Pkg; Pkg.instantiate()'"
-easy-ssh run "julia --project=. src/main.jl"
-easy-ssh pull output/
-```
-
-### Clean remote state
-
-```bash
-easy-ssh clean           # dry-run: shows what would be deleted
-easy-ssh clean --force   # actually delete remote-only files
-```
+- `run`: report output and exit code.
+- `submit`: report the acknowledged PID and how to inspect it.
+- `pull`: report the fetched local path.
+- Transport failure: report it as a monitoring/control failure and preserve the
+  distinction from detached job state.

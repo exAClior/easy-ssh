@@ -4,9 +4,22 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 EASY_SSH_BIN=${EASY_SSH_BIN:-$REPO_ROOT/easy-ssh}
-TEST_ROOT=${TEST_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/easy-ssh-test.XXXXXX")}
+TEST_ROOT_OWNED=0
+if [[ -z ${TEST_ROOT:-} ]]; then
+    TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/easy-ssh test.XXXXXX")
+    TEST_ROOT_OWNED=1
+fi
+CASE_ROOT=$(mktemp -d "/tmp/easy-ssh-cases.XXXXXX")
 SSH_TEST_HOST=${EASY_SSH_TEST_HOST:-}
 SSH_CONFIG_PATH=${EASY_SSH_TEST_CONFIG:-}
+CONTROL_DIR_OWNED=0
+if [[ -n ${EASY_SSH_TEST_CONTROL_DIR:-} ]]; then
+    CONTROL_DIR=$EASY_SSH_TEST_CONTROL_DIR
+else
+    CONTROL_DIR="/tmp/easy-ssh 'ctl' $$"
+    CONTROL_DIR_OWNED=1
+fi
+RSYNC_ARGS_LOG="$TEST_ROOT/rsync-args.log"
 TEST_PATH=${PATH}
 REAL_SSH=""
 REAL_RSYNC=""
@@ -23,11 +36,22 @@ REMOTE_DIR=""
 CASE_DIR=""
 
 cleanup() {
+    if [[ -n ${REAL_SSH:-} && -n ${SSH_TEST_HOST:-} && -n ${SSH_CONFIG_PATH:-} ]]; then
+        "$REAL_SSH" -F "$SSH_CONFIG_PATH" \
+            -o "ControlPath=\"$CONTROL_DIR/%C\"" \
+            -O exit "$SSH_TEST_HOST" >/dev/null 2>&1 || true
+    fi
     if [[ -n ${SSHD_PID:-} ]]; then
         kill "$SSHD_PID" >/dev/null 2>&1 || true
         wait "$SSHD_PID" >/dev/null 2>&1 || true
     fi
-    rm -rf "$TEST_ROOT"
+    if (( TEST_ROOT_OWNED )); then
+        rm -rf "$TEST_ROOT"
+    fi
+    rm -rf "$CASE_ROOT"
+    if (( CONTROL_DIR_OWNED )); then
+        rm -rf "$CONTROL_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -49,6 +73,12 @@ assert_contains() {
     local haystack=$1
     local needle=$2
     [[ $haystack == *"$needle"* ]] || fail "expected output to contain '$needle'. Output:\n$haystack"
+}
+
+assert_not_contains() {
+    local haystack=$1
+    local needle=$2
+    [[ $haystack != *"$needle"* ]] || fail "expected output not to contain '$needle'. Output:\n$haystack"
 }
 
 assert_file_exists() {
@@ -77,6 +107,16 @@ assert_file_equals() {
     local content
     content=$(<"$path")
     [[ $content == "$expected" ]] || fail "expected $path to equal '$expected', got '$content'"
+}
+
+sha256_stream() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        fail "shasum or sha256sum is required to verify skills-lock.json"
+    fi
 }
 
 require_tools() {
@@ -119,9 +159,9 @@ start_test_sshd() {
         cat > "$sshd_config" <<EOF
 Port $port
 ListenAddress 127.0.0.1
-HostKey $host_key
-PidFile $TEST_ROOT/sshd.pid
-AuthorizedKeysFile $auth_keys
+HostKey "$host_key"
+PidFile "$TEST_ROOT/sshd.pid"
+AuthorizedKeysFile "$auth_keys"
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -142,12 +182,14 @@ Host easy-ssh-localhost-test
     HostName 127.0.0.1
     Port $port
     User $user
-    IdentityFile $client_key
+    IdentityFile "$client_key"
     IdentitiesOnly yes
-    StrictHostKeyChecking no
-    UserKnownHostsFile $ssh_dir/known_hosts
+    StrictHostKeyChecking yes
+    UserKnownHostsFile "$ssh_dir/known_hosts"
     LogLevel ERROR
 EOF
+        awk -v port="$port" '{print "[127.0.0.1]:" port, $1, $2}' "$host_key.pub" > "$ssh_dir/known_hosts"
+        chmod 600 "$ssh_dir/known_hosts"
         chmod 600 "$ssh_config"
 
         cat > "$wrapper_bin/ssh" <<EOF
@@ -156,7 +198,13 @@ exec $(printf '%q' "$REAL_SSH") -F $(printf '%q' "$ssh_config") "\$@"
 EOF
         cat > "$wrapper_bin/rsync" <<EOF
 #!/usr/bin/env bash
-exec $(printf '%q' "$REAL_RSYNC") -e $(printf '%q' "$wrapper_bin/ssh") "\$@"
+{
+    printf 'call\n'
+    for arg in "\$@"; do
+        printf 'arg=%s\n' "\$arg"
+    done
+} >> $(printf '%q' "$RSYNC_ARGS_LOG")
+exec $(printf '%q' "$REAL_RSYNC") "\$@"
 EOF
         chmod +x "$wrapper_bin/ssh" "$wrapper_bin/rsync"
 
@@ -189,7 +237,7 @@ setup_ssh() {
 }
 
 setup_case() {
-    CASE_DIR=$(mktemp -d "$TEST_ROOT/case.XXXXXX")
+    CASE_DIR=$(mktemp -d "$CASE_ROOT/case.XXXXXX")
     PROJECT_DIR="$CASE_DIR/project"
     REMOTE_DIR="$CASE_DIR/remote"
     mkdir -p "$PROJECT_DIR" "$REMOTE_DIR"
@@ -214,7 +262,11 @@ run_cmd() {
 run_tool() {
     local dir=$1
     shift
-    run_cmd "$dir" env PATH="$TEST_PATH" "$EASY_SSH_BIN" "$@"
+    run_cmd "$dir" env \
+        PATH="$TEST_PATH" \
+        EASY_SSH_CONTROL_DIR="$CONTROL_DIR" \
+        EASY_SSH_CONTROL_PERSIST=10m \
+        "$EASY_SSH_BIN" "$@"
 }
 
 run_tool_input() {
@@ -222,7 +274,11 @@ run_tool_input() {
     local input=$2
     shift 2
     set +e
-    LAST_OUTPUT=$(cd "$dir" && printf '%b' "$input" | env PATH="$TEST_PATH" "$EASY_SSH_BIN" "$@" 2>&1)
+    LAST_OUTPUT=$(cd "$dir" && printf '%b' "$input" | env \
+        PATH="$TEST_PATH" \
+        EASY_SSH_CONTROL_DIR="$CONTROL_DIR" \
+        EASY_SSH_CONTROL_PERSIST=10m \
+        "$EASY_SSH_BIN" "$@" 2>&1)
     LAST_STATUS=$?
     set -e
 }
@@ -263,7 +319,7 @@ wait_for_log_contains() {
     local needle=$1
     local file="$REMOTE_DIR/.easy-ssh-log"
     local i content
-    for i in $(seq 1 80); do
+    for ((i = 0; i < 80; i++)); do
         if [[ -f $file ]]; then
             content=$(<"$file")
             if [[ $content == *"$needle"* ]]; then
@@ -288,7 +344,66 @@ run_test() {
     fi
 }
 
+help_and_multiplexing_tier() {
+    local broken_script broken_status broken_stderr broken_stdout control_mode expected_lock_hash expected_skill socket
+
+    setup_case
+    write_config
+
+    run_tool "$PROJECT_DIR" --help
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "Focused help (progressive disclosure)"
+    assert_contains "$LAST_OUTPUT" "--help skill"
+    assert_not_contains "$LAST_OUTPUT" "# easy-ssh — Remote Execution"
+
+    run_tool "$PROJECT_DIR" --help jobs
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "Detached jobs continue"
+    assert_not_contains "$LAST_OUTPUT" "## File exclusions"
+
+    run_tool "$PROJECT_DIR" --help=configuration
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "EASY_SSH_CONNECT_TIMEOUT"
+    assert_contains "$LAST_OUTPUT" "default: 30 seconds"
+    assert_contains "$LAST_OUTPUT" "ControlMaster=auto"
+
+    run_tool "$PROJECT_DIR" --help skill
+    assert_status 0
+    expected_skill=$(<"$REPO_ROOT/skills/easy-ssh/SKILL.md")
+    [[ $LAST_OUTPUT == "$expected_skill" ]] || fail "embedded Agent Skill differs from skills/easy-ssh/SKILL.md"
+    [[ $LAST_OUTPUT == "$(<"$REPO_ROOT/.agents/skills/easy-ssh/SKILL.md")" ]] || \
+        fail "embedded Agent Skill differs from .agents/skills/easy-ssh/SKILL.md"
+    expected_lock_hash=$({ printf 'SKILL.md'; cat "$REPO_ROOT/.agents/skills/easy-ssh/SKILL.md"; } | sha256_stream)
+    assert_file_contains "$REPO_ROOT/skills-lock.json" "\"computedHash\": \"$expected_lock_hash\""
+
+    broken_script="$CASE_DIR/easy-ssh-missing-skill-end"
+    broken_stdout="$CASE_DIR/missing-skill-end.stdout"
+    broken_stderr="$CASE_DIR/missing-skill-end.stderr"
+    sed '/^__EASY_SSH_SKILL_END__$/d' "$EASY_SSH_BIN" > "$broken_script"
+    chmod +x "$broken_script"
+    set +e
+    (cd "$PROJECT_DIR" && "$broken_script" --help skill) > "$broken_stdout" 2> "$broken_stderr"
+    broken_status=$?
+    set -e
+    [[ $broken_status -eq 1 ]] || fail "expected malformed embedded skill to exit 1, got $broken_status"
+    [[ ! -s $broken_stdout ]] || fail "malformed embedded skill wrote a partial export to stdout"
+    assert_file_contains "$broken_stderr" "embedded Agent Skill markers are incomplete"
+
+    run_tool "$PROJECT_DIR" status
+    assert_status 0
+    socket=$(find "$CONTROL_DIR" -type s -print -quit 2>/dev/null || true)
+    [[ -n $socket ]] || fail "expected a persistent SSH control socket in $CONTROL_DIR"
+    control_mode=$(stat -f '%Lp' "$CONTROL_DIR" 2>/dev/null || stat -c '%a' "$CONTROL_DIR")
+    [[ $control_mode == 700 ]] || fail "expected $CONTROL_DIR mode 700, got $control_mode"
+
+    run_tool "$PROJECT_DIR" --help unknown-topic
+    assert_status 1
+    assert_contains "$LAST_OUTPUT" "unknown help topic"
+}
+
 core_commands_tier() {
+    local authentications_after authentications_before encoded_control_dir
+
     setup_case
 
     run_tool_input "$PROJECT_DIR" "$SSH_TEST_HOST\n$REMOTE_DIR\n" init
@@ -302,6 +417,9 @@ EOF
     printf 'version-1\n' > "$PROJECT_DIR/code.txt"
     printf 'ignore me\n' > "$PROJECT_DIR/ignored.tmp"
     printf 'remote only\n' > "$REMOTE_DIR/remote-only.txt"
+    if [[ -n $SSHD_PID ]]; then
+        authentications_before=$(grep -c 'Accepted publickey' "$TEST_ROOT/sshd.log" || true)
+    fi
 
     run_tool "$PROJECT_DIR" push
     assert_status 0
@@ -318,9 +436,19 @@ EOF
 
     mkdir -p "$REMOTE_DIR/generated"
     printf 'pulled\n' > "$REMOTE_DIR/generated/result.txt"
+    : > "$RSYNC_ARGS_LOG"
     run_tool "$PROJECT_DIR" pull generated/result.txt
     assert_status 0
     assert_file_equals "$PROJECT_DIR/generated/result.txt" "pulled"
+    assert_file_contains "$RSYNC_ARGS_LOG" "ControlMaster=auto"
+    assert_file_contains "$RSYNC_ARGS_LOG" "ConnectTimeout=30"
+    encoded_control_dir=${CONTROL_DIR//\'/\'\'}
+    assert_file_contains "$RSYNC_ARGS_LOG" "ControlPath=\"$encoded_control_dir/%C\""
+    if [[ -n $SSHD_PID ]]; then
+        authentications_after=$(grep -c 'Accepted publickey' "$TEST_ROOT/sshd.log" || true)
+        [[ $authentications_after == "$authentications_before" ]] || \
+            fail "expected SSH and rsync to reuse the existing master; authenticated connections changed from $authentications_before to $authentications_after"
+    fi
 
     run_tool "$PROJECT_DIR" submit "sleep 2; echo async-line; mkdir -p generated; echo artifact > generated/async.txt"
     assert_status 0
@@ -385,7 +513,9 @@ EOF
 
     write_config
     dd if=/dev/zero of="$PROJECT_DIR/size-guard.bin" bs=2048 count=1 >/dev/null 2>&1
-    run_cmd "$PROJECT_DIR" env PATH="$TEST_PATH" EASY_SSH_SIZE_WARN_KB=1 "$EASY_SSH_BIN" push
+    run_cmd "$PROJECT_DIR" env PATH="$TEST_PATH" \
+        EASY_SSH_CONTROL_DIR="$CONTROL_DIR" EASY_SSH_CONTROL_PERSIST=10m \
+        EASY_SSH_SIZE_WARN_KB=1 "$EASY_SSH_BIN" push
     assert_status 1
     assert_contains "$LAST_OUTPUT" "Refusing to sync"
 }
@@ -400,7 +530,9 @@ default_excludes_tier() {
     dd if=/dev/zero of="$PROJECT_DIR/.venv/big.bin" bs=2048 count=2 >/dev/null 2>&1
     printf 'tracked\n' > "$PROJECT_DIR/tracked.txt"
 
-    run_cmd "$PROJECT_DIR" env PATH="$TEST_PATH" EASY_SSH_SIZE_WARN_KB=1 "$EASY_SSH_BIN" push
+    run_cmd "$PROJECT_DIR" env PATH="$TEST_PATH" \
+        EASY_SSH_CONTROL_DIR="$CONTROL_DIR" EASY_SSH_CONTROL_PERSIST=10m \
+        EASY_SSH_SIZE_WARN_KB=1 "$EASY_SSH_BIN" push
     assert_status 0
     assert_file_equals "$REMOTE_DIR/tracked.txt" "tracked"
     assert_file_missing "$REMOTE_DIR/.git"
@@ -560,6 +692,7 @@ main() {
     note "Using easy-ssh: $EASY_SSH_BIN"
     note "Using SSH host: ${SSH_TEST_HOST}"
 
+    run_test "progressive help and SSH multiplexing" help_and_multiplexing_tier
     run_test "core commands" core_commands_tier
     run_test "error paths" error_paths_tier
     run_test "default excludes" default_excludes_tier

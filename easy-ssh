@@ -7,9 +7,11 @@ IGNORE_FILE=.easy-ssh-ignore
 LOG_FILE=.easy-ssh-log
 STATUS_FILE=.easy-ssh-status
 SIZE_WARN_KB=${EASY_SSH_SIZE_WARN_KB:-512000}
-SSH_CONNECT_TIMEOUT=${EASY_SSH_CONNECT_TIMEOUT:-5}
+SSH_CONNECT_TIMEOUT=${EASY_SSH_CONNECT_TIMEOUT:-30}
+SSH_CONTROL_PERSIST=${EASY_SSH_CONTROL_PERSIST:-10m}
+SSH_CONTROL_DIR=${EASY_SSH_CONTROL_DIR:-}
 LOG_LINES=${EASY_SSH_LOG_LINES:-50}
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT")
+SSH_OPTS=()
 
 remote_name=""
 host=""
@@ -19,35 +21,166 @@ config_remote=""
 DEFAULT_EXCLUDES=(.git .venv)
 RSYNC_ARGS=()
 RSYNC_SIZE_ARGS=()
+RSYNC_SSH=""
 
 usage() {
     cat <<EOF
-Usage:
-  $PROGRAM [--remote NAME] init
-  $PROGRAM [--remote NAME] push [--clean] [--force]
-  $PROGRAM [--remote NAME] run "<cmd>"
-  $PROGRAM [--remote NAME] submit "<cmd>"
-  $PROGRAM [--remote NAME] logs
-  $PROGRAM [--remote NAME] monitor
-  $PROGRAM [--remote NAME] pull <path>
-  $PROGRAM [--remote NAME] clean [--force]
-  $PROGRAM [--remote NAME] status
-
-Options:
-  -r, --remote NAME  Select a named remote section from $CONFIG_FILE
+Usage: $PROGRAM [--remote NAME] <command> [arguments]
 
 Commands:
-  init           Interactive setup for .easy-ssh.conf
-  push           Sync local directory to remote (additive-only)
-  push --clean   Preview destructive sync; add --force to execute
-  run            Push + run command remotely, wait for completion
-  submit         Push + launch remote job via nohup, return immediately
-  logs           Show the tail of the remote log file
-  monitor        Live-stream remote job output (tail -f); stops when job ends
-  pull           Fetch a remote path back into the local project
-  clean          Preview remote-only files; add --force to remove them
-  status         Show config, SSH status, and submitted job status
+  init                         Configure a project remote
+  push [--clean] [--force]    Sync local files to the remote
+  run "<cmd>"                  Run a trivial read-only command and wait
+  submit "<cmd>"               Launch a durable background job
+  logs                         Show recent submitted-job output
+  monitor                      Stream submitted-job output
+  status                       Check SSH and submitted-job state
+  pull <path>                  Fetch a path from the remote project
+  clean [--force]              Preview or remove remote-only files
+
+Options:
+  -r, --remote NAME            Select a named remote from $CONFIG_FILE
+  -h, --help [TOPIC]           Show overview or focused guidance
+
+Focused help (progressive disclosure):
+  $PROGRAM --help getting-started
+  $PROGRAM --help jobs
+  $PROGRAM --help configuration
+  $PROGRAM --help troubleshooting
+  $PROGRAM --help skill          Emit the complete installable Agent Skill
 EOF
+}
+
+help_getting_started() {
+    cat <<EOF
+Getting started
+
+1. Confirm that ssh, rsync, and easy-ssh are available.
+2. In the local project, run:
+
+     $PROGRAM init
+     $PROGRAM status
+
+3. Submit substantive work durably:
+
+     $PROGRAM submit "python train.py"
+     $PROGRAM monitor
+     $PROGRAM status
+
+Use '$PROGRAM run' only for trivial read-only probes that finish in about
+10 seconds. See '$PROGRAM --help jobs' for the durability model.
+EOF
+}
+
+help_jobs() {
+    cat <<EOF
+Remote jobs
+
+  $PROGRAM submit "<cmd>"   Sync, launch with nohup, and return immediately
+  $PROGRAM monitor          Stream the durable log; Ctrl+C only detaches
+  $PROGRAM logs             Show the latest log lines
+  $PROGRAM status           Report running or finished state and exit code
+
+Detached jobs continue if SSH or the invoking terminal disconnects. A failed
+monitoring connection does not mean the job stopped. Do not repeat an uncertain
+submission until '$PROGRAM status' confirms whether a job is already running.
+
+'$PROGRAM run' is intentionally limited to short, read-only probes. Builds,
+tests, downloads, training, and commands that write files belong in 'submit'.
+EOF
+}
+
+help_configuration() {
+    cat <<EOF
+Configuration
+
+$CONFIG_FILE supports a default remote:
+
+  host='a800'
+  remote_dir='~/projects/my-project'
+
+or named sections selected with '--remote NAME':
+
+  [a800]
+  host='a800'
+  remote_dir='~/projects/my-project'
+
+$IGNORE_FILE adds rsync exclusions; .git and .venv are always excluded.
+
+Environment:
+  EASY_SSH_SIZE_WARN_KB       Sync-size refusal threshold (default: 512000)
+  EASY_SSH_CONNECT_TIMEOUT    SSH connect/banner timeout (default: 30 seconds)
+  EASY_SSH_CONTROL_PERSIST    Master connection lifetime (default: 10m)
+  EASY_SSH_CONTROL_DIR        Control socket directory
+                              (default: ~/.ssh/easy-ssh-control)
+  EASY_SSH_LOG_LINES          Lines shown by logs (default: 50)
+
+easy-ssh uses OpenSSH ControlMaster=auto with ControlPersist so status, logs,
+rsync, and launch operations can reuse one authenticated connection. The socket
+directory is private to the local user.
+EOF
+}
+
+help_troubleshooting() {
+    cat <<EOF
+Troubleshooting
+
+  SSH connection failed
+    Verify 'ssh <host> true' works non-interactively. Proxied or loaded hosts may
+    need a larger EASY_SSH_CONNECT_TIMEOUT; the default is 30 seconds.
+
+  Connection timed out during banner exchange
+    The network/proxy/sshd path did not answer before the timeout. Retry status
+    after a short delay. Detached jobs continue independently.
+
+  Job already running
+    Inspect '$PROGRAM status' and '$PROGRAM logs'. Do not resubmit blindly.
+
+  Sync payload too large
+    Add build outputs, datasets, or caches to $IGNORE_FILE, or use --force only
+    after checking the payload.
+
+  Suspected stale multiplexed connection
+    OpenSSH normally replaces stale sockets automatically. To isolate a problem,
+    set EASY_SSH_CONTROL_DIR to a fresh private directory for one invocation.
+EOF
+}
+
+print_agent_skill() {
+    local source=${BASH_SOURCE[0]}
+    local content="" line emitting=0 found_begin=0 found_end=0
+
+    [[ -r $source ]] || die "cannot read embedded Agent Skill from $source"
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line == '__EASY_SSH_SKILL_BEGIN__' ]]; then
+            emitting=1
+            found_begin=1
+            continue
+        fi
+        if [[ $line == '__EASY_SSH_SKILL_END__' ]]; then
+            found_end=1
+            break
+        fi
+        (( emitting )) && content+="$line"$'\n'
+    done < "$source"
+
+    (( found_begin && found_end )) || die "embedded Agent Skill markers are incomplete"
+    printf '%s' "$content"
+}
+
+show_help() {
+    local topic=${1:-overview}
+
+    case "$topic" in
+        overview|commands) usage ;;
+        getting-started) help_getting_started ;;
+        jobs) help_jobs ;;
+        configuration|config) help_configuration ;;
+        troubleshooting) help_troubleshooting ;;
+        skill|agent-skill) print_agent_skill ;;
+        *) die "unknown help topic '$topic' (try '$PROGRAM --help')" ;;
+    esac
 }
 
 info() {
@@ -317,12 +450,54 @@ require_local_tools() {
     done
 }
 
+shell_join() {
+    local joined="" word
+
+    for word in "$@"; do
+        # rsync's -e parser preserves a quote inside a quoted word by doubling it.
+        word=${word//\'/\'\'}
+        joined="${joined}${joined:+ }'$word'"
+    done
+
+    printf '%s' "$joined"
+}
+
+prepare_ssh_options() {
+    [[ ${#SSH_OPTS[@]} -eq 0 ]] || return 0
+
+    local previous_umask
+
+    require_local_tools ssh mkdir chmod
+    if [[ -z $SSH_CONTROL_DIR ]]; then
+        [[ -n ${HOME:-} ]] || die "HOME is not set; set EASY_SSH_CONTROL_DIR explicitly"
+        SSH_CONTROL_DIR="$HOME/.ssh/easy-ssh-control"
+    fi
+
+    previous_umask=$(umask)
+    umask 077
+    mkdir -p -- "$SSH_CONTROL_DIR"
+    umask "$previous_umask"
+    chmod 700 "$SSH_CONTROL_DIR"
+
+    SSH_OPTS=(
+        -o BatchMode=yes
+        -o ConnectTimeout="$SSH_CONNECT_TIMEOUT"
+        -o ControlMaster=auto
+        -o ControlPersist="$SSH_CONTROL_PERSIST"
+        -o "ControlPath=\"$SSH_CONTROL_DIR/%C\""
+    )
+    RSYNC_SSH=$(shell_join ssh "${SSH_OPTS[@]}")
+}
+
 ensure_ssh_connection() {
+    prepare_ssh_options
     ssh "${SSH_OPTS[@]}" "$host" true >/dev/null 2>&1 || die "ssh connection to '$host' failed"
 }
 
 resolve_remote_dir() {
     local create_remote=${1:-0}
+
+    prepare_ssh_options
 
     remote_dir_real=$(ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir" "$create_remote" <<'EOF'
 set -euo pipefail
@@ -394,7 +569,8 @@ check_local_size() {
 build_rsync_args() {
     local pattern
 
-    RSYNC_ARGS=(-avz)
+    prepare_ssh_options
+    RSYNC_ARGS=(-avz -e "$RSYNC_SSH")
     RSYNC_SIZE_ARGS=(-az)
 
     for pattern in "${DEFAULT_EXCLUDES[@]}"; do
@@ -560,6 +736,8 @@ run_remote_command() {
     printf -v qfull '%q' "$full_cmd"
 
     set +e
+    # qfull is intentionally expanded on the client after printf %q escaping.
+    # shellcheck disable=SC2029
     ssh "${SSH_OPTS[@]}" "$host" "bash -l -c $qfull"
     rc=$?
     set -e
@@ -605,10 +783,11 @@ EOF
 )
 
     set +e
+    # The q* values and job_body intentionally instantiate this remote script locally.
+    # shellcheck disable=SC2087
     launch_output=$(ssh "${SSH_OPTS[@]}" "$host" bash -s <<EOF
 set -euo pipefail
 
-session_name=easy-ssh
 status_path=$qstatus
 job_file=$qjobfile
 
@@ -752,7 +931,7 @@ do_pull() {
 
     parent_dir=$(dirname "$path")
     mkdir -p -- "$parent_dir"
-    rsync -avz "$host:$remote_dir_real/$path" "$path"
+    rsync -avz -e "$RSYNC_SSH" "$host:$remote_dir_real/$path" "$path"
 }
 
 do_clean() {
@@ -867,8 +1046,19 @@ main() {
                 shift
                 break
                 ;;
-            -h|--help|help|"")
-                usage
+            -h|--help|help)
+                shift
+                [[ $# -le 1 ]] || die "help accepts at most one topic"
+                show_help "${1:-overview}"
+                return 0
+                ;;
+            --help=*)
+                [[ $# -eq 1 ]] || die "help accepts at most one topic"
+                show_help "${1#--help=}"
+                return 0
+                ;;
+            "")
+                show_help overview
                 return 0
                 ;;
             -*)
@@ -919,13 +1109,195 @@ main() {
             shift
             do_status "$@"
             ;;
-        -h|--help|help|"")
-            usage
+        -h|--help|help)
+            shift
+            [[ $# -le 1 ]] || die "help accepts at most one topic"
+            show_help "${1:-overview}"
+            ;;
+        "")
+            show_help overview
             ;;
         *)
             die "unknown command: $command"
             ;;
     esac
 }
+
+: <<'EASY_SSH_SKILL_PAYLOAD'
+__EASY_SSH_SKILL_BEGIN__
+---
+name: easy-ssh
+description: >
+  Runs local project code on remote machines through the easy-ssh CLI. Use when
+  asked to execute on a server, submit a durable job, use a GPU or CPU cluster,
+  sync or pull project files, inspect remote logs, or check remote job status.
+---
+
+# easy-ssh — Remote Execution
+
+Run local project code on a remote server through SSH and rsync. Keep editing and
+agent work local; submit compute to the configured host.
+
+## Default rule
+
+**Use `easy-ssh submit` for all substantive work. Use `easy-ssh run` only for a
+trivial read-only probe that will finish in about 10 seconds.**
+
+Compilation, tests, training, downloads, data processing, file writes, and loops
+belong in `submit`, even when they are expected to be quick. A blocking `run` can
+outlive the invoking tool timeout and leave an untracked remote process.
+
+```bash
+easy-ssh submit "<command>"
+easy-ssh monitor
+```
+
+The submitted job runs under `nohup`; Ctrl+C or an SSH interruption only detaches
+monitoring and does not stop the remote job.
+
+## Prerequisites
+
+- `easy-ssh`, `ssh`, and `rsync` are available locally.
+- Key-based, non-interactive SSH works for the configured host.
+- The remote machine has `rsync`.
+
+## Workflow
+
+### 1. Inspect configuration
+
+```bash
+ls .easy-ssh.conf 2>/dev/null
+```
+
+A default remote uses:
+
+```bash
+host='<ssh-host>'
+remote_dir='<remote-path>'
+```
+
+Multiple remotes use named sections:
+
+```bash
+[a800]
+host='a800'
+remote_dir='~/projects/mypackage'
+
+[h100]
+host='h100'
+remote_dir='~/projects/mypackage'
+```
+
+- Put `--remote NAME` immediately after `easy-ssh` when selecting a named remote:
+  `easy-ssh --remote h100 status`.
+- One named remote is selected automatically.
+- With multiple named remotes and no default, ask which remote to use before
+  destructive or long-running work.
+- If configuration is missing, ask for the SSH host, remote directory, and
+  optional remote name, then run `easy-ssh init` or
+  `easy-ssh --remote <name> init`.
+
+### 2. Choose the operation
+
+| Intent | Command |
+|---|---|
+| Substantive command | `easy-ssh submit "<cmd>"` |
+| Stream submitted output | `easy-ssh monitor` |
+| Snapshot recent output | `easy-ssh logs` |
+| Check job and SSH state | `easy-ssh status` |
+| Trivial read-only probe | `easy-ssh run "<cmd>"` |
+| Sync only | `easy-ssh push` |
+| Fetch an artifact | `easy-ssh pull <relative-path>` |
+| Preview remote cleanup | `easy-ssh clean` |
+| Apply remote cleanup | `easy-ssh clean --force` |
+
+### 3. Submit and observe durable work
+
+```bash
+easy-ssh submit "python train.py --epochs 10"
+easy-ssh monitor
+easy-ssh status
+easy-ssh logs
+```
+
+Treat control-channel and job state separately:
+
+- A failed `status`, `logs`, or `monitor` connection does **not** imply job
+  failure. Wait briefly and check again.
+- Do not repeat an uncertain submission until `status` confirms whether a job is
+  already running.
+- Report a job as launched only after `submit` prints its PID.
+- Report completion only from a final status/exit code, not from a dropped SSH
+  connection.
+
+### 4. Pull results
+
+```bash
+easy-ssh pull results/metrics.json
+easy-ssh pull checkpoints/
+```
+
+Pull paths are relative to `remote_dir`; absolute paths and `..` are rejected.
+
+## Connection behavior
+
+`easy-ssh` waits up to 30 seconds for SSH connection and banner exchange by
+default. It uses OpenSSH `ControlMaster=auto` and a 10-minute `ControlPersist` so
+the preflight, path resolution, rsync, launch, and monitoring operations can
+reuse one authenticated connection.
+
+The control socket is stored in a private local directory. These settings are
+configurable:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `EASY_SSH_CONNECT_TIMEOUT` | `30` | SSH connect/banner timeout in seconds |
+| `EASY_SSH_CONTROL_PERSIST` | `10m` | Master connection lifetime |
+| `EASY_SSH_CONTROL_DIR` | `~/.ssh/easy-ssh-control` | Private control socket directory |
+| `EASY_SSH_SIZE_WARN_KB` | `512000` | Effective sync-size refusal threshold |
+| `EASY_SSH_LOG_LINES` | `50` | Lines printed by `logs` |
+
+For an intermittent proxied host, prefer a larger timeout over rapid repeated
+connections. Do not add blind retries around `run` or `submit`, because their
+remote outcome can be ambiguous.
+
+## File exclusions
+
+`.git` and `.venv` are always excluded. Add project-specific local-only files to
+`.easy-ssh-ignore` using gitignore-style patterns:
+
+```text
+__pycache__/
+*.pyc
+data/
+node_modules/
+```
+
+`clean` is a dry run. Use `clean --force` only after reviewing its deletion list.
+
+## Progressive CLI guidance
+
+Load only the focused help needed for the current task:
+
+```bash
+easy-ssh --help getting-started
+easy-ssh --help jobs
+easy-ssh --help configuration
+easy-ssh --help troubleshooting
+```
+
+`easy-ssh --help skill` emits this complete installable `SKILL.md`. Do not call it
+after this skill is already loaded unless verifying or exporting the canonical
+skill text.
+
+## Reporting
+
+- `run`: report output and exit code.
+- `submit`: report the acknowledged PID and how to inspect it.
+- `pull`: report the fetched local path.
+- Transport failure: report it as a monitoring/control failure and preserve the
+  distinction from detached job state.
+__EASY_SSH_SKILL_END__
+EASY_SSH_SKILL_PAYLOAD
 
 main "$@"
