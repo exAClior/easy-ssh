@@ -30,9 +30,35 @@ monitoring and does not stop the remote job.
 
 ## Prerequisites
 
-- `easy-ssh`, `ssh`, and `rsync` are available locally.
+- `ssh` and `rsync` are available locally. Check with `command -v ssh` and
+  `command -v rsync`. On Debian/Ubuntu, install them with
+  `sudo apt-get install openssh-client rsync`; on macOS, `ssh` is included and
+  `brew install rsync` installs rsync when needed.
 - Key-based, non-interactive SSH works for the configured host.
-- The remote machine has `rsync`.
+- The remote machine has `rsync`; verify with
+  `ssh <host> 'command -v rsync'` and ask its administrator to install it if
+  absent.
+
+If `easy-ssh` is absent from `PATH`, use the canonical repository's HTTPS
+download, validate it as Bash, and then install it; never pipe a download to a
+shell:
+
+```bash
+# Repository: https://github.com/exAClior/easy-ssh
+(
+  set -eu
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  curl -fL https://raw.githubusercontent.com/exAClior/easy-ssh/main/easy-ssh -o "$tmp"
+  bash -n "$tmp"
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp" "$HOME/.local/bin/easy-ssh"
+)
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Persist that PATH export in the active shell's startup file if necessary, then
+verify with `easy-ssh --help`.
 
 ## Workflow
 
@@ -136,17 +162,25 @@ remote outcome can be ambiguous.
 
 ## File exclusions
 
-`.git` and `.venv` are always excluded. Add project-specific local-only files to
-`.easy-ssh-ignore` using gitignore-style patterns:
+`.git`, `.venv`, `.easy-ssh.conf`, and `.easy-ssh-ignore` are always excluded.
+Add project-specific local-only or generated paths to `.easy-ssh-ignore` using
+gitignore-style patterns:
 
 ```text
 __pycache__/
 *.pyc
 data/
 node_modules/
+target/
+build/
+dist/
 ```
 
 `clean` is a dry run. Use `clean --force` only after reviewing its deletion list.
+Cleanup removes remote-only contents but preserves the configured `remote_dir`
+itself. If a disposable remote root must be deleted intentionally, independently
+validate the exact host and resolved target before a separate explicit removal;
+easy-ssh intentionally provides no broad remote-root removal command.
 
 ## Progressive CLI guidance
 

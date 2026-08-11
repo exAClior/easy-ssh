@@ -18,7 +18,8 @@ host=""
 remote_dir=""
 remote_dir_real=""
 config_remote=""
-DEFAULT_EXCLUDES=(.git .venv)
+DEFAULT_EXCLUDES=(.git .venv "$CONFIG_FILE" "$IGNORE_FILE")
+CLEANABLE_DEFAULT_EXCLUDES=(.git .venv)
 RSYNC_ARGS=()
 RSYNC_SIZE_ARGS=()
 RSYNC_SSH=""
@@ -55,7 +56,29 @@ help_getting_started() {
     cat <<EOF
 Getting started
 
-1. Confirm that ssh, rsync, and easy-ssh are available.
+1. Confirm that ssh and rsync are available:
+
+     command -v ssh
+     command -v rsync
+
+   Debian/Ubuntu: sudo apt-get install openssh-client rsync
+   macOS: ssh is included; install rsync with 'brew install rsync' if needed.
+
+   If easy-ssh is missing, download it before installing (never pipe to a shell):
+
+     Repository: https://github.com/exAClior/easy-ssh
+     (
+       set -eu
+       tmp=\$(mktemp)
+       trap 'rm -f "\$tmp"' EXIT
+       curl -fL https://raw.githubusercontent.com/exAClior/easy-ssh/main/easy-ssh -o "\$tmp"
+       bash -n "\$tmp"
+       mkdir -p "\$HOME/.local/bin"
+       install -m 0755 "\$tmp" "\$HOME/.local/bin/easy-ssh"
+     )
+     export PATH="\$HOME/.local/bin:\$PATH"
+
+   Persist that PATH export in your shell startup file if necessary.
 2. In the local project, run:
 
      $PROGRAM init
@@ -105,7 +128,8 @@ or named sections selected with '--remote NAME':
   host='a800'
   remote_dir='~/projects/my-project'
 
-$IGNORE_FILE adds rsync exclusions; .git and .venv are always excluded.
+$IGNORE_FILE adds rsync exclusions. .git, .venv, $CONFIG_FILE, and
+$IGNORE_FILE are always excluded.
 
 Environment:
   EASY_SSH_SIZE_WARN_KB       Sync-size refusal threshold (default: 512000)
@@ -525,31 +549,23 @@ check_local_size() {
     local size_kb size_mb limit_mb size_bytes=""
     local tmpdir stats line rc
 
-    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/easy-ssh-size.XXXXXX") || true
-    if [[ -n ${tmpdir:-} ]]; then
-        set +e
-        stats=$(rsync "${RSYNC_SIZE_ARGS[@]}" --dry-run --stats ./ "$tmpdir/" 2>/dev/null)
-        rc=$?
-        set -e
-        rm -rf -- "$tmpdir"
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/easy-ssh-size.XXXXXX") || \
+        die "failed to create temporary directory for sync-size check"
+    set +e
+    stats=$(LC_ALL=C rsync "${RSYNC_SIZE_ARGS[@]}" --dry-run --stats ./ "$tmpdir/" 2>/dev/null)
+    rc=$?
+    set -e
+    rm -rf -- "$tmpdir"
+    (( rc == 0 )) || die "failed to calculate effective sync size with rsync"
 
-        if (( rc == 0 )); then
-            while IFS= read -r line; do
-                if [[ $line =~ ^Total\ file\ size:\ ([0-9,]+)\ B$ ]]; then
-                    size_bytes=${BASH_REMATCH[1]//,/}
-                    break
-                fi
-            done <<< "$stats"
+    while IFS= read -r line; do
+        if [[ $line =~ ^Total\ file\ size:\ ([0-9,]+)\ (B|bytes)$ ]]; then
+            size_bytes=${BASH_REMATCH[1]//,/}
+            break
         fi
-    fi
-
-    if [[ -n $size_bytes ]]; then
-        size_kb=$(((size_bytes + 1023) / 1024))
-    else
-        if ! read -r size_kb _ < <(du -sk . 2>/dev/null); then
-            return 0
-        fi
-    fi
+    done <<< "$stats"
+    [[ -n $size_bytes ]] || die "failed to read effective sync size from rsync"
+    size_kb=$(((size_bytes + 1023) / 1024))
 
     if (( size_kb <= SIZE_WARN_KB )); then
         return 0
@@ -587,7 +603,7 @@ build_rsync_args() {
 prune_default_remote_excludes() {
     local force=${1:-0}
 
-    ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir_real" "$force" "${DEFAULT_EXCLUDES[@]}" <<'EOF'
+    ssh "${SSH_OPTS[@]}" "$host" bash -s -- "$remote_dir_real" "$force" "${CLEANABLE_DEFAULT_EXCLUDES[@]}" <<'EOF'
 set -euo pipefail
 
 dir=$1
@@ -613,7 +629,7 @@ push_files() {
     local force=${2:-0}
     local dest
 
-    require_local_tools ssh rsync du mktemp
+    require_local_tools ssh rsync mktemp
     load_config
     ensure_ssh_connection
     resolve_remote_dir 1
@@ -1157,9 +1173,35 @@ monitoring and does not stop the remote job.
 
 ## Prerequisites
 
-- `easy-ssh`, `ssh`, and `rsync` are available locally.
+- `ssh` and `rsync` are available locally. Check with `command -v ssh` and
+  `command -v rsync`. On Debian/Ubuntu, install them with
+  `sudo apt-get install openssh-client rsync`; on macOS, `ssh` is included and
+  `brew install rsync` installs rsync when needed.
 - Key-based, non-interactive SSH works for the configured host.
-- The remote machine has `rsync`.
+- The remote machine has `rsync`; verify with
+  `ssh <host> 'command -v rsync'` and ask its administrator to install it if
+  absent.
+
+If `easy-ssh` is absent from `PATH`, use the canonical repository's HTTPS
+download, validate it as Bash, and then install it; never pipe a download to a
+shell:
+
+```bash
+# Repository: https://github.com/exAClior/easy-ssh
+(
+  set -eu
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  curl -fL https://raw.githubusercontent.com/exAClior/easy-ssh/main/easy-ssh -o "$tmp"
+  bash -n "$tmp"
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp" "$HOME/.local/bin/easy-ssh"
+)
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Persist that PATH export in the active shell's startup file if necessary, then
+verify with `easy-ssh --help`.
 
 ## Workflow
 
@@ -1263,17 +1305,25 @@ remote outcome can be ambiguous.
 
 ## File exclusions
 
-`.git` and `.venv` are always excluded. Add project-specific local-only files to
-`.easy-ssh-ignore` using gitignore-style patterns:
+`.git`, `.venv`, `.easy-ssh.conf`, and `.easy-ssh-ignore` are always excluded.
+Add project-specific local-only or generated paths to `.easy-ssh-ignore` using
+gitignore-style patterns:
 
 ```text
 __pycache__/
 *.pyc
 data/
 node_modules/
+target/
+build/
+dist/
 ```
 
 `clean` is a dry run. Use `clean --force` only after reviewing its deletion list.
+Cleanup removes remote-only contents but preserves the configured `remote_dir`
+itself. If a disposable remote root must be deleted intentionally, independently
+validate the exact host and resolved target before a separate explicit removal;
+easy-ssh intentionally provides no broad remote-root removal command.
 
 ## Progressive CLI guidance
 

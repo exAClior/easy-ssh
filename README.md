@@ -37,19 +37,30 @@ Everything below uses `a800` as the example server. Replace it with your own ser
 You need three tools on your laptop. Open **Terminal** and run each line:
 
 ```bash
-which ssh          # should print a path like /usr/bin/ssh
-which rsync        # should print a path like /usr/bin/rsync
+command -v ssh     # should print a path like /usr/bin/ssh
+command -v rsync   # should print a path like /usr/bin/rsync
 bash --version     # should print "GNU bash, version ..."
 ```
 
-> **macOS / Linux:** All three are pre-installed. You don't need to install anything.
+If either command is absent, install it before continuing:
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install openssh-client rsync
+
+# macOS (ssh is included with macOS)
+brew install rsync
+```
 
 Also confirm that `rsync` exists on the server:
 
 ```bash
-ssh a800 'which rsync'
+ssh a800 'command -v rsync'
 # should print something like /usr/bin/rsync
 ```
+
+If it is absent, ask the remote administrator to install rsync before using
+easy-ssh.
 
 ### Step 2 — Check SSH connection
 
@@ -80,7 +91,7 @@ Pick **one** of the three options below.
 #### Option A: Git clone (recommended — easiest to update later)
 
 ```bash
-git clone git@github.com:exAClior/easy-ssh.git ~/.easy-ssh
+git clone https://github.com/exAClior/easy-ssh.git ~/.easy-ssh
 chmod +x ~/.easy-ssh/easy-ssh
 ```
 
@@ -98,18 +109,31 @@ source ~/.zshrc
 If `~/.local/bin` is already on your PATH (it is on your machine):
 
 ```bash
-git clone git@github.com:exAClior/easy-ssh.git ~/src/easy-ssh
+git clone https://github.com/exAClior/easy-ssh.git ~/src/easy-ssh
 chmod +x ~/src/easy-ssh/easy-ssh
 ln -sf ~/src/easy-ssh/easy-ssh ~/.local/bin/easy-ssh
 ```
 
-#### Option C: Direct download (no git needed, just one command)
+#### Option C: Direct HTTPS download (no git needed)
+
+Download to a temporary file, check its Bash syntax, and only then install it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/exAClior/easy-ssh/main/easy-ssh \
-  -o ~/.local/bin/easy-ssh
-chmod +x ~/.local/bin/easy-ssh
+(
+  set -eu
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  curl -fL https://raw.githubusercontent.com/exAClior/easy-ssh/main/easy-ssh -o "$tmp"
+  bash -n "$tmp"
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmp" "$HOME/.local/bin/easy-ssh"
+)
 ```
+
+The canonical repository is <https://github.com/exAClior/easy-ssh>. Never pipe
+a downloaded script directly to a shell. If `~/.local/bin` is not already on
+your PATH, run `export PATH="$HOME/.local/bin:$PATH"` and persist that line in
+your shell startup file.
 
 ### Step 4 — Verify the install
 
@@ -183,6 +207,11 @@ All commands below assume you are inside your project directory (the one with `.
 | `easy-ssh pull <path>` | Fetch remote files back to your laptop |
 | `easy-ssh clean` | Show remote-only files; `--force` to remove them |
 | `easy-ssh status` | Show config, test SSH connection, check running jobs |
+
+`clean` and `push --clean` preserve the configured `remote_dir` itself. To
+intentionally delete a disposable remote root, independently validate the exact
+host and resolved path before a separate explicit removal; easy-ssh deliberately
+has no broad remote-root removal command.
 
 ### Example: trivial read-only probe
 
@@ -294,7 +323,9 @@ Remote names may contain letters, numbers, `.`, `_`, and `-`.
 
 Controls what **else** doesn't get synced to the server. Same syntax as `.gitignore`.
 
-`easy-ssh` always skips `.git` and `.venv` automatically. Create this file in your project root for any additional local-only paths:
+`easy-ssh` always skips `.git`, `.venv`, `.easy-ssh.conf`, and
+`.easy-ssh-ignore` automatically. Create the ignore file in your project root
+for any additional local-only or generated paths:
 
 ```
 __pycache__/
@@ -302,6 +333,9 @@ __pycache__/
 data/
 *.h5
 node_modules/
+target/
+build/
+dist/
 ```
 
 > **Why?** Without this, `easy-ssh push` would upload everything else in your project — including huge datasets or build artifacts you don't need on the server.
@@ -364,7 +398,7 @@ The integration test boots a temporary localhost `sshd`, points `easy-ssh` at a 
 - core commands (`init`, `push`, `run`, `submit`, `pull`, `logs`, `status`, `clean`)
 - progressive help, exact embedded-skill export, and SSH control-socket creation
 - error paths (missing config, bad host, oversized directories)
-- push safety (ignore files, `--clean` preview, `--force` execution)
+- push safety (operational-metadata exclusions, ignore files, `--clean` preview, `--force` execution)
 - multiple remotes in one config (`--remote`, named sections, named `init`)
 
 ---

@@ -345,7 +345,7 @@ run_test() {
 }
 
 help_and_multiplexing_tier() {
-    local broken_script broken_status broken_stderr broken_stdout control_mode expected_lock_hash expected_skill socket
+    local broken_script broken_status broken_stderr broken_stdout control_mode expected_lock_hash exported_skill socket
 
     setup_case
     write_config
@@ -355,6 +355,19 @@ help_and_multiplexing_tier() {
     assert_contains "$LAST_OUTPUT" "Focused help (progressive disclosure)"
     assert_contains "$LAST_OUTPUT" "--help skill"
     assert_not_contains "$LAST_OUTPUT" "# easy-ssh — Remote Execution"
+
+    run_tool "$PROJECT_DIR" --help getting-started
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "command -v ssh"
+    assert_contains "$LAST_OUTPUT" "command -v rsync"
+    assert_contains "$LAST_OUTPUT" "https://github.com/exAClior/easy-ssh"
+    assert_contains "$LAST_OUTPUT" "set -eu"
+    assert_contains "$LAST_OUTPUT" "trap 'rm -f \"\$tmp\"' EXIT"
+    assert_contains "$LAST_OUTPUT" "install -m 0755 \"\$tmp\" \"\$HOME/.local/bin/easy-ssh\""
+    assert_contains "$LAST_OUTPUT" "export PATH=\"\$HOME/.local/bin:\$PATH\""
+    assert_not_contains "$LAST_OUTPUT" "curl |"
+    [[ $LAST_OUTPUT == *"curl -fL"*"bash -n"*"install -m 0755"* ]] || \
+        fail "expected getting-started help to download, validate, then install"
 
     run_tool "$PROJECT_DIR" --help jobs
     assert_status 0
@@ -369,10 +382,14 @@ help_and_multiplexing_tier() {
 
     run_tool "$PROJECT_DIR" --help skill
     assert_status 0
-    expected_skill=$(<"$REPO_ROOT/skills/easy-ssh/SKILL.md")
-    [[ $LAST_OUTPUT == "$expected_skill" ]] || fail "embedded Agent Skill differs from skills/easy-ssh/SKILL.md"
-    [[ $LAST_OUTPUT == "$(<"$REPO_ROOT/.agents/skills/easy-ssh/SKILL.md")" ]] || \
-        fail "embedded Agent Skill differs from .agents/skills/easy-ssh/SKILL.md"
+    exported_skill="$CASE_DIR/exported-SKILL.md"
+    "$EASY_SSH_BIN" --help skill > "$exported_skill"
+    cmp -s "$exported_skill" "$REPO_ROOT/skills/easy-ssh/SKILL.md" || \
+        fail "embedded Agent Skill differs byte-for-byte from skills/easy-ssh/SKILL.md"
+    cmp -s "$REPO_ROOT/skills/easy-ssh/SKILL.md" "$REPO_ROOT/.agents/skills/easy-ssh/SKILL.md" || \
+        fail "skills/easy-ssh/SKILL.md differs byte-for-byte from .agents/skills/easy-ssh/SKILL.md"
+    cmp -s "$exported_skill" "$REPO_ROOT/.agents/skills/easy-ssh/SKILL.md" || \
+        fail "embedded Agent Skill differs byte-for-byte from .agents/skills/easy-ssh/SKILL.md"
     expected_lock_hash=$({ printf 'SKILL.md'; cat "$REPO_ROOT/.agents/skills/easy-ssh/SKILL.md"; } | sha256_stream)
     assert_file_contains "$REPO_ROOT/skills-lock.json" "\"computedHash\": \"$expected_lock_hash\""
 
@@ -393,7 +410,7 @@ help_and_multiplexing_tier() {
     assert_status 0
     socket=$(find "$CONTROL_DIR" -type s -print -quit 2>/dev/null || true)
     [[ -n $socket ]] || fail "expected a persistent SSH control socket in $CONTROL_DIR"
-    control_mode=$(stat -f '%Lp' "$CONTROL_DIR" 2>/dev/null || stat -c '%a' "$CONTROL_DIR")
+    control_mode=$(stat -c '%a' "$CONTROL_DIR" 2>/dev/null || stat -f '%Lp' "$CONTROL_DIR")
     [[ $control_mode == 700 ]] || fail "expected $CONTROL_DIR mode 700, got $control_mode"
 
     run_tool "$PROJECT_DIR" --help unknown-topic
@@ -528,6 +545,8 @@ default_excludes_tier() {
     printf 'ref: refs/heads/main\n' > "$PROJECT_DIR/.git/HEAD"
     printf '#!/usr/bin/env python\n' > "$PROJECT_DIR/.venv/bin/python"
     dd if=/dev/zero of="$PROJECT_DIR/.venv/big.bin" bs=2048 count=2 >/dev/null 2>&1
+    printf '# %02048d\n' 0 >> "$PROJECT_DIR/.easy-ssh.conf"
+    printf '# %02048d\n' 0 > "$PROJECT_DIR/.easy-ssh-ignore"
     printf 'tracked\n' > "$PROJECT_DIR/tracked.txt"
 
     run_cmd "$PROJECT_DIR" env PATH="$TEST_PATH" \
@@ -537,6 +556,8 @@ default_excludes_tier() {
     assert_file_equals "$REMOTE_DIR/tracked.txt" "tracked"
     assert_file_missing "$REMOTE_DIR/.git"
     assert_file_missing "$REMOTE_DIR/.venv"
+    assert_file_missing "$REMOTE_DIR/.easy-ssh.conf"
+    assert_file_missing "$REMOTE_DIR/.easy-ssh-ignore"
 }
 
 push_safety_tier() {
@@ -557,17 +578,32 @@ EOF
     assert_status 0
     assert_file_equals "$REMOTE_DIR/tracked.txt" "tracked"
     assert_file_missing "$REMOTE_DIR/ignored.txt"
+    assert_file_missing "$REMOTE_DIR/.easy-ssh.conf"
+    assert_file_missing "$REMOTE_DIR/.easy-ssh-ignore"
     assert_file_exists "$REMOTE_DIR/remote-only.txt"
+
+    printf 'legacy remote config\n' > "$REMOTE_DIR/.easy-ssh.conf"
+    printf 'legacy remote policy\n' > "$REMOTE_DIR/.easy-ssh-ignore"
 
     run_tool "$PROJECT_DIR" push --clean
     assert_status 0
     assert_contains "$LAST_OUTPUT" "remote-only.txt"
     assert_contains "$LAST_OUTPUT" ".git"
     assert_contains "$LAST_OUTPUT" ".venv"
+    assert_not_contains "$LAST_OUTPUT" ".easy-ssh.conf"
+    assert_not_contains "$LAST_OUTPUT" ".easy-ssh-ignore"
     assert_contains "$LAST_OUTPUT" "Preview only"
     assert_file_exists "$REMOTE_DIR/remote-only.txt"
     assert_file_exists "$REMOTE_DIR/.git"
     assert_file_exists "$REMOTE_DIR/.venv"
+    assert_file_equals "$REMOTE_DIR/.easy-ssh.conf" "legacy remote config"
+    assert_file_equals "$REMOTE_DIR/.easy-ssh-ignore" "legacy remote policy"
+
+    run_tool "$PROJECT_DIR" clean
+    assert_status 0
+    assert_contains "$LAST_OUTPUT" "remote-only.txt"
+    assert_not_contains "$LAST_OUTPUT" ".easy-ssh.conf"
+    assert_not_contains "$LAST_OUTPUT" ".easy-ssh-ignore"
 
     run_tool "$PROJECT_DIR" push --clean --force
     assert_status 0
@@ -575,6 +611,15 @@ EOF
     assert_file_missing "$REMOTE_DIR/ignored.txt"
     assert_file_missing "$REMOTE_DIR/.git"
     assert_file_missing "$REMOTE_DIR/.venv"
+    assert_file_equals "$REMOTE_DIR/.easy-ssh.conf" "legacy remote config"
+    assert_file_equals "$REMOTE_DIR/.easy-ssh-ignore" "legacy remote policy"
+
+    printf 'clean-only\n' > "$REMOTE_DIR/clean-only.txt"
+    run_tool "$PROJECT_DIR" clean --force
+    assert_status 0
+    assert_file_missing "$REMOTE_DIR/clean-only.txt"
+    assert_file_equals "$REMOTE_DIR/.easy-ssh.conf" "legacy remote config"
+    assert_file_equals "$REMOTE_DIR/.easy-ssh-ignore" "legacy remote policy"
 }
 
 multiple_remotes_tier() {
